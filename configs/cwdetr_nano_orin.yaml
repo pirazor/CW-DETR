@@ -1,0 +1,79 @@
+# ============================================================================
+# CW-DETR-Nano  —  real-time tier, target: Jetson Orin Nano Super (8GB, INT8)
+# Backbone: DINOv3 ConvNeXt-Tiny (distilled from ViT-7B) — INT8/TensorRT friendly.
+# ============================================================================
+name: cwdetr-nano
+description: Real-time multi-task ADAS perception for Jetson Orin Nano (INT8).
+
+input:
+  height: 384          # 384 / 16 = 24 patch rows
+  width:  640          # 640 / 16 = 40 patch cols  (16:9.6, wide automotive FoV)
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std:  [0.229, 0.224, 0.225]
+
+model:
+  hidden_dim: 256
+  backbone:
+    type: dinov3_convnext            # dinov3_convnext | dinov3_vit
+    hf_name: facebook/dinov3-convnext-tiny-pretrain-lvd1689m
+    # ConvNeXt-Tiny stage channels [96,192,384,768] @ strides [4,8,16,32].
+    out_indices: [1, 2, 3]           # -> channels [192,384,768] @ strides [8,16,32]
+    out_channels: [192, 384, 768]
+    out_strides: [8, 16, 32]
+    freeze_stages: 0                 # 0 = train all; >0 freezes early stages
+    drop_path_rate: 0.1
+    gram_anchor_distill: true        # use frozen DINOv3 ViT teacher for feature distill
+    teacher_hf_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+
+  projector:                         # single/multi-scale -> unified pyramid (C2f-style)
+    type: c2f_multiscale
+    num_levels: 3
+    hidden_dim: 256
+
+  decoder:                           # shared deformable-DETR decoder (all heads tap this)
+    hidden_dim: 256
+    num_heads: 8
+    num_layers: 3
+    dim_feedforward: 1024
+    num_queries: 300
+    num_feature_levels: 3
+    dec_n_points: 4
+    two_stage: true
+    look_forward_twice: true
+    box_noise_scale: 1.0             # DN-DETR denoising during training
+
+  heads:
+    detection:
+      enabled: true
+      num_classes: 13                # unified BDD100K+nuScenes taxonomy (see data/taxonomy.py)
+    tracking:
+      enabled: true
+      mode: track_query              # track_query | bytetrack_only
+      max_active_tracks: 200
+      score_thresh: 0.5
+      match_thresh: 0.8
+    segmentation:
+      enabled: true
+      drivable_classes: 3            # bg / direct / alternative  (BDD100K)
+      lane_classes: 2                # bg / lane-line (binary; set 9 for typed lanes)
+      mask_stride: 4                 # mask resolution = input / 4
+    sign_classification:
+      enabled: true
+      num_sign_classes: 43           # GTSRB; set 401 for Mapillary Traffic Sign
+      source_det_class: 11           # det class id 'traffic_sign' -> ROI crops feed this head
+      roi_size: 7
+    trajectory:
+      enabled: true
+      history_len: 10                # past observations fed from the tracker
+      future_len: 12                 # predict 12 steps
+      step_dt: 0.5                   # seconds/step -> 6.0 s horizon
+      num_modes: 6                   # multimodal (winner-takes-all training)
+      space: image                   # image | bev
+
+deploy:
+  target: jetson_orin_nano
+  precision: int8                    # int8 with fp16 fallback for unsupported layers
+  fp16_fallback: true
+  max_workspace_gb: 4
+  calib_images: 500                  # INT8 PTQ calibration set size
+  expected_fps_int8: 35              # design target @ 384x640, batch 1 (see whitepaper)

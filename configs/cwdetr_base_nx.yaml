@@ -1,0 +1,84 @@
+# ============================================================================
+# CW-DETR-Base  —  high-accuracy tier, target: Jetson Orin NX 16GB (FP16)
+# Backbone: DINOv3 ViT-B/16 — RoPE + Gram-anchored dense features for max accuracy.
+# A single-scale ViT is lifted to a 3-level pyramid (ViTDet-style) by the projector.
+# ============================================================================
+name: cwdetr-base
+description: High-accuracy multi-task ADAS perception for Jetson Orin NX (FP16).
+
+input:
+  height: 512          # 512 / 16 = 32
+  width:  896          # 896 / 16 = 56
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std:  [0.229, 0.224, 0.225]
+
+model:
+  hidden_dim: 384
+  backbone:
+    type: dinov3_vit                 # single-scale ViT, stride 16
+    hf_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    embed_dim: 768                   # ViT-B/16 hidden size
+    depth: 12
+    num_register_tokens: 4
+    # Tap 3 intermediate blocks; projector builds a {1/8, 1/16, 1/32} pyramid.
+    out_layer_indices: [5, 8, 11]    # 0-indexed transformer blocks
+    simple_fpn: true                 # ViTDet simple feature pyramid (deconv/conv resampling)
+    windowed_attention: true         # RF-DETR-style windowed/global alternation
+    window_block_indices: [0,1,3,4,6,7,9,10]   # remaining blocks use global attention
+    window_size: 8                   # in patch units
+    freeze_blocks: 0
+    drop_path_rate: 0.2
+    gram_anchor_distill: false       # ViT-B is already the strong tier
+
+  projector:
+    type: c2f_multiscale
+    num_levels: 3
+    hidden_dim: 384
+
+  decoder:
+    hidden_dim: 384
+    num_heads: 8
+    num_layers: 6
+    dim_feedforward: 2048
+    num_queries: 300
+    num_feature_levels: 3
+    dec_n_points: 4
+    two_stage: true
+    look_forward_twice: true
+    box_noise_scale: 1.0
+
+  heads:
+    detection:
+      enabled: true
+      num_classes: 13
+    tracking:
+      enabled: true
+      mode: track_query
+      max_active_tracks: 300
+      score_thresh: 0.5
+      match_thresh: 0.8
+    segmentation:
+      enabled: true
+      drivable_classes: 3
+      lane_classes: 9                # typed lanes (crosswalk, single/double, dashed...)
+      mask_stride: 4
+    sign_classification:
+      enabled: true
+      num_sign_classes: 401          # Mapillary Traffic Sign full taxonomy
+      source_det_class: 11
+      roi_size: 7
+    trajectory:
+      enabled: true
+      history_len: 10
+      future_len: 12
+      step_dt: 0.5
+      num_modes: 6
+      space: bev                     # BEV trajectories (nuScenes ego/agent frame)
+
+deploy:
+  target: jetson_orin_nx_16gb
+  precision: fp16
+  fp16_fallback: true
+  max_workspace_gb: 8
+  calib_images: 0
+  expected_fps_fp16: 22              # design target @ 512x896, batch 1 (see whitepaper)

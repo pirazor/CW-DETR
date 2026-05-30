@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Third-party clones (use setup_clone.sh to fetch)
+/third_party/
+
+# Weights & data (anchored to repo root so cwdetr/data/ source is NOT ignored)
+*.pth
+*.pt
+*.onnx
+*.engine
+*.trt
+*.plan
+*.calib
+/checkpoints/
+/

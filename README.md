@@ -1,0 +1,146 @@
+<div align="center">
+
+# CW-DETR
+
+**A DINOv3 multi-task perception model for ADAS — built on RF-DETR.**
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pirazor/CW-DETR/blob/main/notebooks/CW_DETR_Colab.ipynb)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.3%2B-ee4c2c.svg)](https://pytorch.org/)
+[![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-green.svg)](#license)
+
+*One camera frame in → detection, tracking, lane/area segmentation, sign classification, and trajectory prediction out — in a single forward pass.*
+
+</div>
+
+---
+
+## What is this?
+
+CW-DETR is an **end-to-end perception stack for advanced driver assistance**. It takes Roboflow's
+[**RF-DETR**](https://github.com/roboflow/rf-detr) — the current state of the art for real-time
+detection transformers — and makes two structural upgrades:
+
+1. **DINOv2 → DINOv3 backbone.** Patch-16 (fewer tokens → faster), rotary position embeddings
+   (native multi-resolution), **Gram-anchored dense features** (much cleaner masks and small
+   objects), and a fully-convolutional **ConvNeXt** edge variant distilled from a 7B-parameter
+   teacher (INT8/TensorRT-friendly). This single change improves accuracy *and* latency.
+
+2. **One detector → one shared trunk + five task heads.** The expensive backbone and deformable
+   decoder run **once per frame**; five lightweight heads share the representation. Five tasks for
+   roughly the cost of one detector — which is what makes a full perception stack run on a Jetson
+   Orin Nano.
+
+> **Status:** complete, runnable reference implementation — **not yet trained**. Every module is
+> real PyTorch and the architecture is shape-verified by `tests/test_forward.py`. All accuracy /
+> latency figures in the docs are engineering targets derived from component baselines, not
+> measured CW-DETR results.
+
+## Capabilities
+
+| Head | Task | Approach |
+|---|---|---|
+| Detection | 2D objects, 13-class ADAS taxonomy | DETR class + box, iterative refinement |
+| Tracking | Multi-object tracking + IDs | Query-based (MOTR-style) **+** ByteTrack fallback |
+| Segmentation | Drivable area + lane lines | Semantic-FPN over DINOv3 dense features |
+| Sign classification | Fine-grained sign type | ROI cascade off the detector (GTSRB / Mapillary) |
+| Trajectory | Multimodal path prediction | Per-track motion decoder, winner-takes-all |
+
+## Architecture
+
+```
+                 ┌───────────── shared trunk (runs once per frame) ─────────────┐
+   image ─► DINOv3 backbone ─► multi-scale projector ─► deformable-DETR decoder ─┘
+            (ConvNeXt-T / ViT-B)   (C2f / PAN neck)       (two-stage, box-refine)
+                          │ dense maps                     │ query embeddings
+        ┌─────────────────┴───────┬──────────────┬─────────┴───────┬──────────────┐
+        ▼                         ▼              ▼                 ▼              ▼
+   segmentation              detection     track queries      sign class.    trajectory
+   lane + drivable           cls + box     (MOTR-style)       (ROI cascade)   (multimodal)
+```
+
+Full rationale, training plan, Jetson optimization, and roadmap:
+**[`docs/CW-DETR_Architecture_and_Strategy.md`](docs/CW-DETR_Architecture_and_Strategy.md)**.
+
+## Deployment tiers
+
+| Tier | Backbone | Precision | Target board | Input | Design target |
+|---|---|---|---|---|---|
+| **CW-DETR-N** | DINOv3 ConvNeXt-Tiny | INT8 | Jetson Orin Nano Super (8 GB, 67 TOPS) | 384×640 | ~35 FPS |
+| **CW-DETR-B** | DINOv3 ViT-B/16 | FP16 | Jetson Orin NX 16 GB (100–157 TOPS) | 512×896 | ~22 FPS |
+
+## Quickstart
+
+### ▶ Colab (easiest — no local setup, GPU optional)
+Open [`notebooks/CW_DETR_Colab.ipynb`](notebooks/CW_DETR_Colab.ipynb) in Colab (badge above). It
+installs deps, runs the shape sanity tests (no gated weights needed), and optionally builds the
+real DINOv3 model after a Hugging Face login.
+
+### 💻 Local
+```bash
+bash setup_clone.sh          # clones rf-detr + dinov3, installs deps, inspects the DINOv2 seam
+huggingface-cli login        # DINOv3 weights are gated — accept the model licenses on the Hub
+
+# sanity-check shapes end-to-end (dummy backbone, no download, runs on CPU)
+python -m tests.test_forward --config configs/cwdetr_nano_orin.yaml
+
+# train across datasets (provide the roots you have)
+python -m cwdetr.engine.train --config configs/cwdetr_nano_orin.yaml \
+    --bdd-root /data/bdd100k --gtsrb-root /data/GTSRB --epochs 50
+
+# export + build a Jetson engine (run the TensorRT build on-device)
+python -m cwdetr.export.export_onnx    --config configs/cwdetr_nano_orin.yaml --out cwdetr.onnx
+python -m cwdetr.export.build_tensorrt --onnx cwdetr.onnx --precision int8 \
+    --calib-dir /data/calib --out cwdetr_nano_int8.plan
+python -m cwdetr.export.jetson_infer   --engine cwdetr_nano_int8.plan --track
+```
+
+## Repository layout
+
+```
+CW-DETR/
+├── configs/                 cwdetr_nano_orin.yaml (INT8) · cwdetr_base_nx.yaml (FP16)
+├── cwdetr/
+│   ├── config.py            typed YAML config loader
+│   ├── models/
+│   │   ├── backbone/        DINOv3 wrapper + windowed attention + ViTDet simple-FPN
+│   │   ├── projector.py     PAN / C2f multi-scale neck
+│   │   ├── decoder/         deformable attention (grid_sample, ONNX-friendly) + decoder
+│   │   ├── heads/           detection · track-query · segmentation · sign · trajectory
+│   │   ├── cwdetr.py        top-level model (shared trunk → 5 heads)
+│   │   ├── matcher.py       Hungarian matcher
+│   │   └── criterion.py     multi-task loss + uncertainty weighting + distillation
+│   ├── tracking/            ByteTrack associator (deterministic deploy path)
+│   ├── data/                BDD100K · nuScenes · sign datasets · mixed sampler · transforms
+│   ├── engine/train.py      multi-task trainer (AMP, param groups, distillation)
+│   └── export/              ONNX export · TensorRT build (INT8/FP16) · Jetson runtime
+├── notebooks/               Colab notebook
+├── tests/test_forward.py    offline shape/forward sanity tests (mocked backbone)
+├── docs/                    architecture & strategy whitepaper
+└── setup_clone.sh           clone rf-detr + dinov3, install, investigate the DINOv2 seam
+```
+
+## Design targets vs. baselines
+
+| Task | Public baseline | CW-DETR target |
+|---|---|---|
+| Detection (BDD100K) | YOLOP 76.5 mAP50 | RF-DETR-class AP via DINOv3 features |
+| Drivable area | YOLOP 91.5 mIoU / YOLOPv2 ~93 | ≥ 93 mIoU (Gram-anchored dense features) |
+| Lane lines | YOLOP 26.2 IoU | sharper masks from clean dense features |
+| Tracking | ByteTrack | competitive AMOTA via track queries |
+| Signs | GTSRB >99% on crops | high top-1 via ROI cascade |
+
+*(Targets are projections from component baselines, not measured CW-DETR results.)*
+
+## License
+
+The CW-DETR code in this repository is released under **Apache-2.0**. It builds on RF-DETR
+(Nano–Large: Apache-2.0) and the **DINOv3** weights, which are distributed under **Meta's DINOv3
+license** (gated on Hugging Face; commercial use permitted under its terms). Review the DINOv3
+license before shipping a product; the backbone interface is swappable if a fully-permissive
+backbone is required.
+
+## Acknowledgements
+
+RF-DETR (Roboflow), DINOv3 (Meta AI), Deformable DETR, DINO, LW-DETR, ViTDet, MOTR/MOTRv2,
+ByteTrack, YOLOP/YOLOPv2, nuScenes, BDD100K, GTSRB, Mapillary Traffic 
