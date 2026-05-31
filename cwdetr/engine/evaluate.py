@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from cwdetr.config import load_config
 from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
-                         build_transforms, collate_fn)
+                         build_transforms, collate_fn, YoloDetectionDataset)
 from cwdetr.engine.utils import targets_to_device
 from cwdetr.models.cwdetr import build_cwdetr
 
@@ -210,13 +210,17 @@ def evaluate_loader(model, loader, device, num_classes: int,
     return metrics
 
 
-def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None):
+def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None):
     transforms = build_transforms(cfg, train=False)
     datasets = []
     if bdd_root:
         datasets.append(BDD100KDataset(bdd_root, "val", transforms, load_seg=True))
     if gtsrb_root:
         datasets.append(GTSRBSigns(gtsrb_root, "test", transforms))
+    if yolo_data:
+        datasets.append(YoloDetectionDataset(
+            yolo_data, "val", transforms,
+            expected_num_classes=cfg.model.heads.detection.num_classes))
     if not datasets:
         raise ValueError("provide at least one validation root")
     return ConcatMultiTaskDataset(datasets)
@@ -234,6 +238,8 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--ckpt", default=None)
     parser.add_argument("--bdd-root", default=None)
+    parser.add_argument("--yolo-data", default=None,
+                        help="YOLO data.yaml for detection-only evaluation")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
@@ -247,7 +253,7 @@ def main():
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         model.load_state_dict(checkpoint.get("ema", checkpoint.get("model", checkpoint)),
                               strict=False)
-    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root)
+    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, collate_fn=collate_fn,
                         pin_memory=device.type == "cuda")

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from cwdetr.config import config_to_dict, load_config
 from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
                          MixedBatchSampler, NuScenesSequences, build_transforms,
-                         collate_fn)
+                         collate_fn, YoloDetectionDataset)
 from cwdetr.engine.evaluate import build_eval_dataset, evaluate_loader, print_metrics
 from cwdetr.engine.utils import (ModelEMA, build_warmup_cosine_scheduler,
                                  make_worker_init_fn, seed_everything,
@@ -46,6 +46,11 @@ def build_datasets(cfg, args):
     if args.bdd_root:
         datasets.append(BDD100KDataset(args.bdd_root, "train", transforms, load_seg=True))
         weights.append(2.0)
+    if args.yolo_data:
+        datasets.append(YoloDetectionDataset(
+            args.yolo_data, "train", transforms,
+            expected_num_classes=cfg.model.heads.detection.num_classes))
+        weights.append(2.0)
     if args.gtsrb_root:
         datasets.append(GTSRBSigns(args.gtsrb_root, "train", transforms))
         weights.append(1.0)
@@ -57,7 +62,7 @@ def build_datasets(cfg, args):
             transforms=transforms))
         weights.append(1.0)
     if not datasets:
-        raise ValueError("provide at least one dataset root, for example --bdd-root")
+        raise ValueError("provide at least one dataset root, for example --bdd-root or --yolo-data")
     return ConcatMultiTaskDataset(datasets), weights
 
 
@@ -180,6 +185,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--bdd-root", default=None)
+    parser.add_argument("--yolo-data", default=None,
+                        help="YOLO data.yaml for detection-only training")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--nuscenes-root", default=None)
     parser.add_argument("--nuscenes-version", default="v1.0-trainval")
@@ -236,8 +243,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     writer = _summary_writer(os.path.join(args.out, "tensorboard"), rank)
     val_loader = None
-    if rank == 0 and (args.bdd_root or args.gtsrb_root):
-        val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root)
+    if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
+        val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root,
+                                         args.yolo_data)
         val_loader = DataLoader(
             val_dataset, batch_size=args.eval_batch_size, shuffle=False,
             num_workers=args.workers, collate_fn=collate_fn,

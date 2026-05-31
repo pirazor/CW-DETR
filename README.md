@@ -126,6 +126,24 @@ python -m cwdetr.export.profile_jetson --core-engine cwdetr_nano_int8.plan \
     --sign-engine cwdetr_sign_fp16.plan --precision int8 --out profiles/nano_int8.json
 ```
 
+### YOLO-format BDD100K detection-only training
+
+For a YOLO export with sibling `images/` and `labels/` directories, use the
+nine-class detection-only config and pass its `data.yaml` directly:
+
+```bash
+python -m cwdetr.engine.train \
+    --config configs/cwdetr_nano_yolo_bdd_detection.yaml \
+    --yolo-data /data/bdd100k_merged/data.yaml --epochs 50
+python -m cwdetr.engine.evaluate \
+    --config configs/cwdetr_nano_yolo_bdd_detection.yaml \
+    --yolo-data /data/bdd100k_merged/data.yaml \
+    --ckpt checkpoints/best_detection_map.pth
+```
+
+Colab workflow:
+**[`notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb`](notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb)**.
+
 ## Repository layout
 
 ```
