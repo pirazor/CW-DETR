@@ -201,7 +201,8 @@ class DeformableTransformer(nn.Module):
             self.enc_output_norm = nn.LayerNorm(d)
             self.enc_objectness = nn.Linear(d, 1)
             self.enc_bbox = MLP(d, d, 4, 3)
-            self.pos_trans = nn.Linear(d, d)
+            # proposal pos-embed is 4 coords * (d/2) feats = 2d wide -> project to d
+            self.pos_trans = nn.Linear(d * 2, d)
             self.pos_trans_norm = nn.LayerNorm(d)
         else:
             self.query_embed = nn.Embedding(cfg.num_queries, d * 2)
@@ -267,6 +268,4 @@ class DeformableTransformer(nn.Module):
             "init_reference": init_reference,  # [B, Lq, 2 or 4]
             "inter_references": inter_ref,     # [n_layers, B, Lq, 2 or 4]
             "memory": src_flatten,             # [B, sum(HW), C]  (for seg head)
-            "spatial_shapes": spatial_shapes,
-            "enc_outputs": enc_out,
-        }
+   

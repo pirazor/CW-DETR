@@ -152,8 +152,8 @@ class MultiTaskCriterion(nn.Module):
 
     # ---- distillation ----------------------------------------------------- #
     def loss_distill(self, student_feat, teacher_feat) -> torch.Tensor:
-        if teacher_feat is None or self.distill_proj is None:
-            return student_feat.new_zeros(())
+        if student_feat is None or teacher_feat is None or self.distill_proj is None:
+            return self.weighter.log_vars.new_zeros(())
         s = self.distill_proj(student_feat)
         if s.shape[-2:] != teacher_feat.shape[-2:]:
             s = F.interpolate(s, size=teacher_feat.shape[-2:], mode="bilinear", align_corners=False)
@@ -181,5 +181,4 @@ class MultiTaskCriterion(nn.Module):
                                   ["detection", "segmentation", "sign", "trajectory"]})
         distill = self.loss_distill(student_feat, teacher_feat) * self.distill_weight
         losses["distill"] = distill
-        losses["total"] = weighted + distill
-        return losses
+        losses["total"] = weighte
