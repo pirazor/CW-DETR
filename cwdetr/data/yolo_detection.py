@@ -18,8 +18,9 @@ Google Drive only need one recursive image scan.
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TypeVar
 
 import torch
 import yaml
@@ -28,6 +29,27 @@ from torch.utils.data import Dataset
 
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
+TRANSIENT_IO_ERRNOS = {5, 16, 110, 116}
+T = TypeVar("T")
+
+
+def _retry_remote_io(action: Callable[[], T], description: str,
+                     attempts: int = 5, initial_delay: float = 0.25) -> T:
+    """Retry transient mounted-filesystem failures with a short backoff."""
+    for attempt in range(attempts):
+        try:
+            return action()
+        except OSError as exc:
+            if exc.errno not in TRANSIENT_IO_ERRNOS or attempt + 1 == attempts:
+                if exc.errno in TRANSIENT_IO_ERRNOS:
+                    raise OSError(
+                        exc.errno,
+                        f"{description} failed after {attempts} attempts. "
+                        "If this is a mounted Google Drive path, remount Drive and retry "
+                        "the cell without rebuilding the dataset index.",
+                        exc.filename) from exc
+                raise
+            time.sleep(initial_delay * (2 ** attempt))
 
 
 def _ordered_names(raw_names, num_classes: int) -> List[str]:
@@ -59,8 +81,9 @@ class YoloDetectionDataset(Dataset):
         self.data_yaml = Path(data_yaml).expanduser().resolve()
         self.split = split
         self.transforms = transforms
-        with self.data_yaml.open("r", encoding="utf-8") as handle:
-            spec = yaml.safe_load(handle) or {}
+        spec = yaml.safe_load(_retry_remote_io(
+            lambda: self.data_yaml.read_text(encoding="utf-8"),
+            f"reading YOLO dataset config {self.data_yaml}")) or {}
         if split not in spec:
             raise ValueError(f"YOLO data.yaml does not define the {split!r} split")
         try:
@@ -81,7 +104,8 @@ class YoloDetectionDataset(Dataset):
         if not image_dir.is_absolute():
             image_dir = self.root / image_dir
         self.image_dir = image_dir.resolve()
-        if not self.image_dir.is_dir():
+        if not _retry_remote_io(self.image_dir.is_dir,
+                                f"checking YOLO image directory {self.image_dir}"):
             raise FileNotFoundError(f"YOLO image directory does not exist: {self.image_dir}")
 
         parts = list(self.image_dir.parts)
@@ -97,9 +121,14 @@ class YoloDetectionDataset(Dataset):
             raise ValueError(f"YOLO split contains no supported images: {self.image_dir}")
 
     def _load_images(self, refresh_index: bool) -> List[Path]:
-        if self.index_path.exists() and not refresh_index:
+        index_exists = _retry_remote_io(
+            self.index_path.exists, f"checking YOLO image manifest {self.index_path}")
+        if index_exists and not refresh_index:
             images = []
-            for relative in self.index_path.read_text(encoding="utf-8").splitlines():
+            manifest = _retry_remote_io(
+                lambda: self.index_path.read_text(encoding="utf-8"),
+                f"reading YOLO image manifest {self.index_path}")
+            for relative in manifest.splitlines():
                 if not relative:
                     continue
                 relative_path = Path(relative)
@@ -115,7 +144,9 @@ class YoloDetectionDataset(Dataset):
         if self.images:
             contents = "\n".join(
                 path.relative_to(self.image_dir).as_posix() for path in self.images) + "\n"
-            self.index_path.write_text(contents, encoding="utf-8")
+            _retry_remote_io(
+                lambda: self.index_path.write_text(contents, encoding="utf-8"),
+                f"writing YOLO image manifest {self.index_path}")
         return self.images
 
     def __len__(self) -> int:
@@ -126,11 +157,14 @@ class YoloDetectionDataset(Dataset):
 
     def _load_labels(self, image_path: Path):
         label_path = self._label_path(image_path)
-        if not label_path.exists():
+        try:
+            contents = _retry_remote_io(
+                lambda: label_path.read_text(encoding="utf-8"),
+                f"reading YOLO label file {label_path}")
+        except FileNotFoundError:
             return torch.zeros(0, dtype=torch.long), torch.zeros(0, 4)
         labels, boxes = [], []
-        for line_number, line in enumerate(
-                label_path.read_text(encoding="utf-8").splitlines(), start=1):
+        for line_number, line in enumerate(contents.splitlines(), start=1):
             if not line.strip():
                 continue
             fields = line.split()
@@ -160,7 +194,12 @@ class YoloDetectionDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict:
         image_path = self.images[index]
-        image = Image.open(image_path).convert("RGB")
+        def load_image():
+            with Image.open(image_path) as opened:
+                opened.load()
+                return opened.convert("RGB")
+
+        image = _retry_remote_io(load_image, f"reading YOLO image file {image_path}")
         width, height = image.size
         labels, boxes = self._load_labels(image_path)
         relative_path = image_path.relative_to(self.image_dir).as_posix()

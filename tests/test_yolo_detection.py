@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -95,6 +96,30 @@ def test_yolo_detection_dataset_rejects_non_detection_rows(tmp_path):
     dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
     with pytest.raises(ValueError, match="expected YOLO detection row"):
         dataset[0]
+
+
+def test_yolo_detection_dataset_retries_transient_label_reads(tmp_path):
+    yaml_path = _write_yaml(tmp_path)
+    _write_image(tmp_path, "train", "sample.jpg")
+    label = tmp_path / "train" / "labels" / "sample.txt"
+    label.parent.mkdir(parents=True)
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
+    original_read_text = Path.read_text
+    failures = 0
+
+    def flaky_read_text(path, *args, **kwargs):
+        nonlocal failures
+        if path == label and failures < 2:
+            failures += 1
+            raise OSError(5, "simulated mounted-drive failure", str(path))
+        return original_read_text(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", flaky_read_text), \
+            mock.patch("cwdetr.data.yolo_detection.time.sleep"):
+        sample = dataset[0]
+    assert failures == 2
+    assert sample["labels"].tolist() == [0]
 
 
 def test_yolo_detection_only_config_and_eval_builder(tmp_path):
