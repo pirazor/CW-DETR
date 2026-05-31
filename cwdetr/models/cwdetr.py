@@ -17,7 +17,7 @@ how MOT is actually deployed; ``track_instances`` carries state across frames.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -75,10 +75,11 @@ class CWDETR(nn.Module):
 
     # ----------------------------------------------------------------------- #
     def forward(self, images: torch.Tensor,
-                track_instances: Optional[TrackInstances] = None,
-                sign_rois: Optional[torch.Tensor] = None,
-                traj_history: Optional[torch.Tensor] = None,
-                run_seg: bool = True) -> Dict:
+                 track_instances: Optional[TrackInstances] = None,
+                 sign_rois: Optional[torch.Tensor] = None,
+                 traj_history: Optional[torch.Tensor] = None,
+                 run_seg: bool = True,
+                 detection_targets: Optional[List[Dict]] = None) -> Dict:
         """images: [B, 3, H, W] normalized.  Returns a dict of per-task outputs."""
         feats = self.backbone(images)              # list of maps
         srcs = self.projector(feats)               # num_levels maps @ hidden_dim
@@ -92,8 +93,13 @@ class CWDETR(nn.Module):
             extra_qp = track_instances.query_pos[None]
             extra_ref = track_instances.ref_points[None]     # [1, T, 4]
 
-        dec = self.transformer(srcs, extra_q, extra_qp, extra_ref)
+        dec = self.transformer(srcs, extra_q, extra_qp, extra_ref,
+                               dn_targets=detection_targets)
         det = self.detection_head(dec["hs"], dec["inter_references"])
+        dn_meta = dec["dn_meta"]
+        dn_out = None
+        if dn_meta:
+            det, dn_out = self._split_dn_outputs(det, num_track, dn_meta["pad_size"])
 
         results: Dict = {
             "detection": det,
@@ -102,6 +108,9 @@ class CWDETR(nn.Module):
             "_srcs": srcs,                          # kept for loss-time ROI pooling
             "_image_hw": images.shape[-2:],
         }
+        if dn_out is not None:
+            results["dn_outputs"] = dn_out
+            results["dn_meta"] = dn_meta
 
         if self.seg_head is not None and run_seg:
             results["segmentation"] = self.seg_head(srcs, images.shape[-2:])
@@ -117,6 +126,37 @@ class CWDETR(nn.Module):
             results["trajectory"] = {"traj": traj, "mode_logits": mode_logits}
 
         return results
+
+    @staticmethod
+    def _split_dn_outputs(det: Dict, num_track: int, pad_size: int):
+        dn_start, dn_end = num_track, num_track + pad_size
+
+        def regular(tensor):
+            return torch.cat([tensor[:, :dn_start], tensor[:, dn_end:]], dim=1)
+
+        def denoising(tensor):
+            return tensor[:, dn_start:dn_end]
+
+        clean = {
+            "pred_logits": regular(det["pred_logits"]),
+            "pred_boxes": regular(det["pred_boxes"]),
+            "aux_outputs": [
+                {"pred_logits": regular(aux["pred_logits"]),
+                 "pred_boxes": regular(aux["pred_boxes"])}
+                for aux in det.get("aux_outputs", [])
+            ],
+            "query_embed": regular(det["query_embed"]),
+        }
+        dn_out = {
+            "pred_logits": denoising(det["pred_logits"]),
+            "pred_boxes": denoising(det["pred_boxes"]),
+            "aux_outputs": [
+                {"pred_logits": denoising(aux["pred_logits"]),
+                 "pred_boxes": denoising(aux["pred_boxes"])}
+                for aux in det.get("aux_outputs", [])
+            ],
+        }
+        return clean, dn_out
 
     # ----------------------------------------------------------------------- #
     @torch.no_grad()

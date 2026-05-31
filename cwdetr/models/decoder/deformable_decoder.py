@@ -13,7 +13,7 @@ later by track queries (MOTR-style) and DN-DETR denoising groups.
 from __future__ import annotations
 
 import math
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -186,6 +186,11 @@ class DeformableTransformer(nn.Module):
         self.num_queries = cfg.num_queries
         self.num_levels = cfg.num_feature_levels
         self.two_stage = cfg.two_stage
+        self.dn_enabled = cfg.dn_enabled
+        self.dn_num_groups = cfg.dn_num_groups
+        self.label_noise_ratio = cfg.label_noise_ratio
+        self.box_noise_scale = cfg.box_noise_scale
+        self.num_classes = num_classes
 
         self.pos_embed = PositionEmbeddingSine(d // 2)
         self.level_embed = nn.Parameter(torch.zeros(cfg.num_feature_levels, d))
@@ -213,6 +218,8 @@ class DeformableTransformer(nn.Module):
         else:
             self.query_embed = nn.Embedding(cfg.num_queries, d * 2)
             self.reference_points = nn.Linear(d, 2)
+        if self.dn_enabled:
+            self.dn_label_embed = nn.Embedding(num_classes, d)
 
     @staticmethod
     def _flatten(srcs, pos_embeds, level_embed):
@@ -224,11 +231,59 @@ class DeformableTransformer(nn.Module):
             pos_flatten.append(pos.flatten(2).transpose(1, 2) + level_embed[lvl].view(1, 1, -1))
         return (torch.cat(src_flatten, 1), torch.cat(pos_flatten, 1), shapes)
 
+    def _build_dn_queries(self, targets: List[Dict], dtype, device):
+        counts = [len(target["labels"]) if target.get("train_detection", True) else 0
+                  for target in targets]
+        max_gt = max(counts, default=0)
+        if max_gt == 0:
+            return None
+        batch_size = len(targets)
+        pad_size = max_gt * self.dn_num_groups
+        labels = torch.zeros(batch_size, pad_size, dtype=torch.long, device=device)
+        boxes = torch.zeros(batch_size, pad_size, 4, dtype=dtype, device=device)
+        valid = torch.zeros(batch_size, pad_size, dtype=torch.bool, device=device)
+        for batch_index, (target, count) in enumerate(zip(targets, counts)):
+            if count == 0:
+                continue
+            target_labels = target["labels"].to(device)
+            target_boxes = target["boxes"].to(device=device, dtype=dtype)
+            for group in range(self.dn_num_groups):
+                slots = group * max_gt + torch.arange(count, device=device)
+                labels[batch_index, slots] = target_labels
+                boxes[batch_index, slots] = target_boxes
+                valid[batch_index, slots] = True
+
+        noisy_labels = labels.clone()
+        corrupt = (torch.rand(batch_size, pad_size, device=device) < self.label_noise_ratio) & valid
+        noisy_labels[corrupt] = torch.randint(
+            self.num_classes, (int(corrupt.sum()),), device=device)
+        noisy_boxes = boxes.clone()
+        scale = torch.cat([boxes[..., 2:], boxes[..., 2:]], dim=-1)
+        noise = (torch.rand_like(noisy_boxes) * 2.0 - 1.0) * scale * self.box_noise_scale
+        noisy_boxes = (noisy_boxes + noise).clamp(0.001, 0.999)
+
+        tgt = self.dn_label_embed(noisy_labels)
+        query_pos = self.pos_trans_norm(self.pos_trans(
+            get_proposal_pos_embed(inverse_sigmoid(noisy_boxes), self.d_model // 2)))
+        mask = torch.zeros(pad_size + self.num_queries, pad_size + self.num_queries,
+                           dtype=torch.bool, device=device)
+        # Matching queries must not copy the known GT denoising slots.
+        mask[pad_size:, :pad_size] = True
+        # Denoising groups reconstruct independently.
+        for group in range(self.dn_num_groups):
+            start, end = group * max_gt, (group + 1) * max_gt
+            mask[start:end, :start] = True
+            mask[start:end, end:pad_size] = True
+        meta = {"labels": labels, "boxes": boxes, "valid": valid,
+                "pad_size": pad_size, "num_groups": self.dn_num_groups}
+        return tgt, query_pos, noisy_boxes, mask, meta
+
     def forward(self, srcs: List[torch.Tensor],
-                extra_queries: Optional[torch.Tensor] = None,
-                extra_query_pos: Optional[torch.Tensor] = None,
-                extra_reference_points: Optional[torch.Tensor] = None,
-                self_attn_mask: Optional[torch.Tensor] = None):
+                 extra_queries: Optional[torch.Tensor] = None,
+                 extra_query_pos: Optional[torch.Tensor] = None,
+                 extra_reference_points: Optional[torch.Tensor] = None,
+                 self_attn_mask: Optional[torch.Tensor] = None,
+                 dn_targets: Optional[List[Dict]] = None):
         """``extra_*`` carry track queries (prepended to the object queries)."""
         pos_embeds = [self.pos_embed(s) for s in srcs]
         src_flatten, lvl_pos_flatten, spatial_shapes = self._flatten(
@@ -236,7 +291,7 @@ class DeformableTransformer(nn.Module):
         b = src_flatten.shape[0]
         valid_ratios = torch.ones(b, self.num_levels, 2, device=src_flatten.device)
 
-        enc_out = {}
+        enc_out, dn_meta = {}, {}
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
                 src_flatten, spatial_shapes)
@@ -253,7 +308,7 @@ class DeformableTransformer(nn.Module):
                 coord, 1, topk_idx[..., None].expand(-1, -1, 4)).sigmoid()
             ref = enc_coord_sel.detach()
             query_pos = self.pos_trans_norm(self.pos_trans(
-                get_proposal_pos_embed(ref, self.d_model // 2)))
+                get_proposal_pos_embed(inverse_sigmoid(ref), self.d_model // 2)))
             tgt = torch.gather(output_memory, 1,
                                topk_idx[..., None].expand(-1, -1, self.d_model)).detach()
             enc_out = {"pred_logits": enc_logits_sel, "pred_boxes": enc_coord_sel}
@@ -264,11 +319,29 @@ class DeformableTransformer(nn.Module):
             tgt = tgt[None].expand(b, -1, -1)
             ref = self.reference_points(query_pos).sigmoid()               # [B, Q, 2]
 
+        if self.training and self.dn_enabled and dn_targets is not None:
+            dn = self._build_dn_queries(dn_targets, src_flatten.dtype, src_flatten.device)
+            if dn is not None:
+                if self_attn_mask is not None:
+                    raise ValueError("DN-DETR cannot combine with a caller-provided attention mask")
+                dn_tgt, dn_pos, dn_ref, self_attn_mask, dn_meta = dn
+                tgt = torch.cat([dn_tgt, tgt], dim=1)
+                query_pos = torch.cat([dn_pos, query_pos], dim=1)
+                ref = torch.cat([dn_ref, ref], dim=1)
+
         # Prepend track queries (MOTR-style) if provided.
         if extra_queries is not None:
+            num_extra = extra_queries.shape[1]
             tgt = torch.cat([extra_queries, tgt], dim=1)
             query_pos = torch.cat([extra_query_pos, query_pos], dim=1)
             ref = torch.cat([extra_reference_points, ref], dim=1)
+            if self_attn_mask is not None:
+                extended = torch.zeros(
+                    num_extra + self_attn_mask.shape[0],
+                    num_extra + self_attn_mask.shape[1],
+                    dtype=self_attn_mask.dtype, device=self_attn_mask.device)
+                extended[num_extra:, num_extra:] = self_attn_mask
+                self_attn_mask = extended
 
         init_reference = ref
         hs, inter_ref = self.decoder(
@@ -281,4 +354,5 @@ class DeformableTransformer(nn.Module):
             "memory": src_flatten,             # [B, sum(HW), C]  (for seg head)
             "spatial_shapes": spatial_shapes,
             "enc_outputs": enc_out,
+            "dn_meta": dn_meta,
         }

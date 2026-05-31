@@ -141,7 +141,8 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
         sign_rois = batch["extras"]["sign_rois"].to(device)
 
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            outputs = model(images, sign_rois=sign_rois if sign_rois.numel() else None)
+            outputs = model(images, sign_rois=sign_rois if sign_rois.numel() else None,
+                            detection_targets=targets["detection"])
             teacher_feat = raw_model.backbone.teacher_features(images) if distill_on else None
             student_feat = outputs["_srcs"][1] if distill_on else None
             losses = criterion(outputs, targets, student_feat, teacher_feat)
@@ -206,7 +207,8 @@ def main():
                    if cfg.model.backbone.gram_anchor_distill else None)
     criterion = MultiTaskCriterion(cfg.model.heads.detection.num_classes,
                                    teacher_dim=teacher_dim,
-                                   student_dim=cfg.model.hidden_dim).to(device)
+                                   student_dim=cfg.model.hidden_dim,
+                                   dn_loss_weight=cfg.model.decoder.dn_loss_weight).to(device)
     dataset, weights = build_datasets(cfg, args)
     sampler = MixedBatchSampler(dataset, args.batch_size, weights, seed=args.seed,
                                 rank=rank, world_size=world_size)

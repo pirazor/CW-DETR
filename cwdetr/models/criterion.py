@@ -62,13 +62,14 @@ class UncertaintyWeighter(nn.Module):
 class MultiTaskCriterion(nn.Module):
     def __init__(self, num_classes: int, teacher_dim: Optional[int] = None,
                  student_dim: int = 256, distill_weight: float = 1.0,
-                 focal_alpha: float = 0.25):
+                 focal_alpha: float = 0.25, dn_loss_weight: float = 1.0):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = HungarianMatcher(focal_alpha=focal_alpha)
         self.focal_alpha = focal_alpha
         self.det_weights = {"loss_ce": 2.0, "loss_bbox": 5.0, "loss_giou": 2.0}
         self.distill_weight = distill_weight
+        self.dn_loss_weight = dn_loss_weight
         self.weighter = UncertaintyWeighter(
             ["detection", "segmentation", "sign", "trajectory"])
         if teacher_dim is not None:
@@ -136,6 +137,31 @@ class MultiTaskCriterion(nn.Module):
         det_loss = sum(self.det_weights[k] * v for k, v in total.items())
         return {"detection": det_loss, **{f"det/{k}": v for k, v in total.items()}}
 
+    def loss_dn_detection(self, dn_out, meta) -> Dict[str, torch.Tensor]:
+        all_outputs = [{"pred_logits": dn_out["pred_logits"],
+                        "pred_boxes": dn_out["pred_boxes"]}] + dn_out.get("aux_outputs", [])
+        valid = meta["valid"]
+        num_boxes = max(1, int(valid.sum()))
+        labels = meta["labels"][valid]
+        target_boxes = meta["boxes"][valid]
+        total = {"loss_ce": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
+        for output in all_outputs:
+            logits = output["pred_logits"][valid]
+            boxes = output["pred_boxes"][valid]
+            if logits.numel() == 0:
+                zero = output["pred_logits"].sum() * 0.0
+                total = {key: value + zero for key, value in total.items()}
+                continue
+            onehot = F.one_hot(labels, self.num_classes).float()
+            total["loss_ce"] += sigmoid_focal_loss(
+                logits, onehot, self.focal_alpha) / num_boxes
+            total["loss_bbox"] += F.l1_loss(boxes, target_boxes, reduction="sum") / num_boxes
+            total["loss_giou"] += (1 - torch.diag(generalized_box_iou(
+                box_cxcywh_to_xyxy(boxes), box_cxcywh_to_xyxy(target_boxes)))).sum() / num_boxes
+        detection = sum(self.det_weights[key] * value for key, value in total.items())
+        return {"dn/detection": detection,
+                **{f"dn/{key}": value for key, value in total.items()}}
+
     # ---- segmentation ----------------------------------------------------- #
     def loss_segmentation(self, seg_out, drivable_gt, lane_gt) -> torch.Tensor:
         loss = 0.0
@@ -195,6 +221,10 @@ class MultiTaskCriterion(nn.Module):
             losses["detection"] = losses["detection"] + enc["detection"]
             losses.update({key.replace("det/", "enc_det/"): value
                            for key, value in enc.items() if key.startswith("det/")})
+        if "dn_outputs" in outputs:
+            dn = self.loss_dn_detection(outputs["dn_outputs"], outputs["dn_meta"])
+            losses["detection"] = losses["detection"] + self.dn_loss_weight * dn["dn/detection"]
+            losses.update(dn)
 
         has_seg_target = targets.get("drivable") is not None or targets.get("lane") is not None
         losses["segmentation"] = (self.loss_segmentation(

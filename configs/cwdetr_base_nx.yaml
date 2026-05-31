@@ -60,7 +60,11 @@ model:
     dec_n_points: 4
     two_stage: true
     look_forward_twice: true
+    dn_enabled: false                # enable only after baseline convergence ablation
+    dn_num_groups: 5
+    label_noise_ratio: 0.2
     box_noise_scale: 1.0
+    dn_loss_weight: 1.0
 
   heads:
     detection:
