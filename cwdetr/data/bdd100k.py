@@ -16,7 +16,6 @@ import json
 import os
 from typing import Dict, List
 
-import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset

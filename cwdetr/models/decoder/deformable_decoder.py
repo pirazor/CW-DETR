@@ -13,7 +13,7 @@ later by track queries (MOTR-style) and DN-DETR denoising groups.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -79,8 +79,8 @@ def gen_encoder_output_proposals(memory, spatial_shapes):
     proposals, cur = [], 0
     for h, w in spatial_shapes:
         grid_y, grid_x = torch.meshgrid(
-            torch.linspace(0.5, h - 0.5, h, device=memory.device),
-            torch.linspace(0.5, w - 0.5, w, device=memory.device), indexing="ij")
+            torch.arange(h, device=memory.device, dtype=memory.dtype),
+            torch.arange(w, device=memory.device, dtype=memory.dtype), indexing="ij")
         grid = torch.stack([grid_x, grid_y], -1)               # (h, w, 2)
         scale = torch.tensor([w, h], device=memory.device).view(1, 1, 2)
         grid = (grid.unsqueeze(0).expand(b, -1, -1, -1) + 0.5) / scale
@@ -237,6 +237,8 @@ class DeformableTransformer(nn.Module):
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
             obj = self.enc_objectness(output_memory)                       # [B, L, 1]
             coord = self.enc_bbox(output_memory) + output_proposals        # [B, L, 4]
+            valid = torch.isfinite(output_proposals).all(-1, keepdim=True)
+            obj = obj.masked_fill(~valid, float("-inf"))
             topk = min(self.num_queries, obj.shape[1])
             topk_idx = torch.topk(obj[..., 0], topk, dim=1)[1]
             ref = torch.gather(coord, 1, topk_idx[..., None].expand(-1, -1, 4)).sigmoid()

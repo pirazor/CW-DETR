@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, get_type_hints
 
 import yaml
 
@@ -158,7 +158,9 @@ def _from_dict(cls, data: Optional[Dict[str, Any]]):
     if not is_dataclass(cls):
         return data
     kwargs: Dict[str, Any] = {}
-    type_hints = {f.name: f.type for f in fields(cls)}
+    # ``from __future__ import annotations`` stores dataclass field annotations
+    # as strings. Resolve them before checking for nested dataclasses.
+    type_hints = get_type_hints(cls)
     for f in fields(cls):
         if f.name not in data:
             continue
@@ -177,11 +179,39 @@ def _from_dict(cls, data: Optional[Dict[str, Any]]):
 
 def load_config(path: str) -> CWDETRConfig:
     """Load a YAML config file into a typed ``CWDETRConfig``."""
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
-    return _from_dict(CWDETRConfig, raw)
+    cfg = _from_dict(CWDETRConfig, raw)
+    validate_config(cfg)
+    return cfg
 
 
 def config_to_dict(cfg: CWDETRConfig) -> Dict[str, Any]:
     """Round-trip back to a plain dict (for logging / checkpoint metadata)."""
     return dataclasses.asdict(cfg)
+
+
+def validate_config(cfg: CWDETRConfig) -> None:
+    """Fail early on shape mismatches that would otherwise surface deep in a run."""
+    m = cfg.model
+    b = m.backbone
+    d = m.decoder
+    if cfg.input.height <= 0 or cfg.input.width <= 0:
+        raise ValueError("input height and width must be positive")
+    if m.hidden_dim != m.projector.hidden_dim or m.hidden_dim != d.hidden_dim:
+        raise ValueError("model, projector, and decoder hidden_dim values must match")
+    if d.hidden_dim % d.num_heads:
+        raise ValueError("decoder hidden_dim must be divisible by num_heads")
+    if d.num_feature_levels != m.projector.num_levels:
+        raise ValueError("decoder num_feature_levels must match projector num_levels")
+    if len(b.out_channels) != len(b.out_strides):
+        raise ValueError("backbone out_channels and out_strides must have the same length")
+    if len(b.out_channels) > d.num_feature_levels:
+        raise ValueError("backbone cannot emit more levels than the decoder consumes")
+    if b.out_strides and any(
+            size % max(b.out_strides) for size in (cfg.input.height, cfg.input.width)):
+        raise ValueError("input height and width must be divisible by the coarsest backbone stride")
+    det_classes = m.heads.detection.num_classes
+    source_cls = m.heads.sign_classification.source_det_class
+    if m.heads.sign_classification.enabled and not 0 <= source_cls < det_classes:
+        raise ValueError("sign source_det_class must index the detection taxonomy")

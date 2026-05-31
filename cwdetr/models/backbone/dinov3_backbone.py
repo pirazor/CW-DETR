@@ -35,7 +35,6 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from cwdetr.config import BackboneCfg
 
@@ -178,6 +177,9 @@ class DINOv3Backbone(nn.Module):
             return feats
 
         # ----- ViT path: single stride-16 map -> simple feature pyramid ---- #
+        if self.cfg.windowed_attention:
+            from cwdetr.models.backbone.windowed_attention import set_grid_hw
+            set_grid_hw(self.encoder, hp, wp)
         if self._mode == "autobackbone":
             # Use the last requested layer's map (already [B, C, hp, wp]).
             fmap = self.encoder(x).feature_maps[-1]

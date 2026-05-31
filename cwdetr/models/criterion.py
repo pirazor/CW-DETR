@@ -146,7 +146,7 @@ class MultiTaskCriterion(nn.Module):
         err = ((traj - fut_gt[:, None]) ** 2).sum(-1).sqrt()       # [N, M, T]
         err = (err * fut_mask[:, None]).sum(-1) / fut_mask.sum(-1).clamp(min=1)[:, None]
         best = err.argmin(1)                                       # [N]
-        reg = err[torch.arange(err.shape[0]), best].mean()         # min-ADE
+        reg = err[torch.arange(err.shape[0], device=err.device), best].mean()  # min-ADE
         cls = F.cross_entropy(logits, best)
         return reg + cls
 
@@ -168,9 +168,10 @@ class MultiTaskCriterion(nn.Module):
         det = self.loss_detection(outputs["detection"], targets["detection"])
         losses.update(det)
 
+        has_seg_target = targets.get("drivable") is not None or targets.get("lane") is not None
         losses["segmentation"] = (self.loss_segmentation(
             outputs["segmentation"], targets.get("drivable"), targets.get("lane"))
-            if "segmentation" in outputs else None)
+            if "segmentation" in outputs and has_seg_target else None)
         losses["sign"] = (self.loss_sign(outputs["sign_logits"], targets["sign_labels"])
                           if "sign_logits" in outputs and "sign_labels" in targets else None)
         losses["trajectory"] = (self.loss_trajectory(
@@ -181,4 +182,5 @@ class MultiTaskCriterion(nn.Module):
                                   ["detection", "segmentation", "sign", "trajectory"]})
         distill = self.loss_distill(student_feat, teacher_feat) * self.distill_weight
         losses["distill"] = distill
-        losses["total"] = weighte
+        losses["total"] = weighted + distill
+        return losses

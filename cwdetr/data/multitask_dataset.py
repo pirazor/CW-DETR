@@ -21,7 +21,8 @@ class ConcatMultiTaskDataset(Dataset):
         self.lengths = [len(d) for d in datasets]
         self.offsets, c = [], 0
         for n in self.lengths:
-            self.offsets.append(c); c += n
+            self.offsets.append(c)
+            c += n
         self.total = c
 
     def __len__(self):
@@ -71,7 +72,7 @@ class MixedBatchSampler(Sampler):
             total -= 1
 
     def __len__(self):
-        return sum(max(0, l // self.bs) for l in self.concat.lengths)
+        return sum(max(0, length // self.bs) for length in self.concat.lengths)
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
@@ -107,6 +108,8 @@ def collate_fn(batch: List[Dict]) -> Dict:
     if all("future" in s for s in batch):
         targets["future"] = torch.cat([s["future"] for s in batch], 0)
         targets["future_mask"] = torch.cat([s["future_mask"] for s in batch], 0)
+    if all("track_ids" in s for s in batch):
+        targets["track_ids"] = [s["track_ids"] for s in batch]
 
     extras = {"sign_rois": sign_rois, "dataset": batch[0].get("dataset", "?")}
     return {"images": images, "targets": targets, "extras": extras}

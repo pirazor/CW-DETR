@@ -17,7 +17,7 @@ how MOT is actually deployed; ``track_instances`` carries state across frames.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -99,10 +99,11 @@ class CWDETR(nn.Module):
             "num_track": num_track,
             "enc_outputs": dec["enc_outputs"],
             "_srcs": srcs,                          # kept for loss-time ROI pooling
+            "_image_hw": images.shape[-2:],
         }
 
         if self.seg_head is not None and run_seg:
-            results["segmentation"] = self.seg_head(srcs, self.input_hw)
+            results["segmentation"] = self.seg_head(srcs, images.shape[-2:])
 
         # sign sub-classification (teacher-forced ROIs during training)
         if self.sign_head is not None and sign_rois is not None:
@@ -135,7 +136,7 @@ class CWDETR(nn.Module):
         """Build ROIs (image coords) from boxes the detector called 'traffic_sign'."""
         det = results["detection"]
         logits, boxes = det["pred_logits"], det["pred_boxes"]          # [B, Lq, *]
-        h, w = self.input_hw
+        h, w = results.get("_image_hw", self.input_hw)
         rois = []
         for b in range(logits.shape[0]):
             scores = logits[b].sigmoid()

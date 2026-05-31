@@ -108,13 +108,16 @@ class BYTETracker:
             return [], list(range(len(tracks))), list(range(len(dets)))
         track_boxes = np.stack([t.xyxy for t in tracks])
         iou = _iou(track_boxes, dets)
+        track_classes = np.asarray([t.cls for t in tracks])
+        iou = np.where(track_classes[:, None] == clss[None, :], iou, -1.0)
         rows, cols = linear_sum_assignment(-iou)
         matches, um_t, um_d = [], list(range(len(tracks))), list(range(len(dets)))
         for r, c in zip(rows, cols):
             if iou[r, c] >= thresh:
                 tracks[r].update(dets[c], scores[c])
                 matches.append((r, c))
-                um_t.remove(r); um_d.remove(c)
+                um_t.remove(r)
+                um_d.remove(c)
         return matches, um_t, um_d
 
     def update(self, boxes_xyxy: np.ndarray, scores: np.ndarray, classes: np.ndarray):
@@ -134,7 +137,8 @@ class BYTETracker:
         hi_boxes, hi_scores, hi_cls = boxes_xyxy[hi], scores[hi], classes[hi]
         for d in um_d:
             t = STrack(hi_boxes[d], hi_scores[d], int(hi_cls[d]))
-            t.track_id = STrack.next_id(); t.hits = 1
+            t.track_id = STrack.next_id()
+            t.hits = 1
             self.tracks.append(t)
 
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]

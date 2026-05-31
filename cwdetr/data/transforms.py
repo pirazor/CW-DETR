@@ -37,7 +37,7 @@ class RandomHFlip:
         self.p = p
 
     def __call__(self, s: Dict) -> Dict:
-        if random.random() > self.p:
+        if s.get("disable_hflip") or random.random() > self.p:
             return s
         s["image"] = TF.hflip(s["image"])
         for k in ("drivable", "lane"):
@@ -50,6 +50,8 @@ class RandomHFlip:
             x1 = w - s["sign_boxes"][:, 2]
             x2 = w - s["sign_boxes"][:, 0]
             s["sign_boxes"][:, 0], s["sign_boxes"][:, 2] = x1, x2
+        if s.get("future") is not None and s.get("trajectory_space") == "image":
+            s["future"][..., 0] *= -1
         return s
 
 

@@ -9,7 +9,7 @@ after construction. Boxes therefore come straight out of the decoder's
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -39,12 +39,15 @@ class DetectionHead(nn.Module):
 
     def forward(self, hs: torch.Tensor, inter_references: torch.Tensor) -> Dict:
         """hs: [L, B, Lq, C]; inter_references: [L, B, Lq, 4] (sigmoid boxes)."""
-        logits = torch.stack([self.class_embed[l](hs[l]) for l in range(self.num_layers)])
+        logits = torch.stack([
+            self.class_embed[layer_idx](hs[layer_idx])
+            for layer_idx in range(self.num_layers)
+        ])
         boxes = inter_references                       # already refined boxes
         out = {"pred_logits": logits[-1], "pred_boxes": boxes[-1]}
         out["aux_outputs"] = [
-            {"pred_logits": logits[l], "pred_boxes": boxes[l]}
-            for l in range(self.num_layers - 1)
+            {"pred_logits": logits[layer_idx], "pred_boxes": boxes[layer_idx]}
+            for layer_idx in range(self.num_layers - 1)
         ]
         # expose query embeddings for the sign / trajectory heads
         out["query_embed"] = hs[-1]                    # [B, Lq, C]

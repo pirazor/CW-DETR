@@ -47,21 +47,22 @@ def export(config: str, ckpt: str, out_path: str, opset: int = 17):
     wrapper = CWDETRInfer(model).eval()
     dummy = torch.randn(1, 3, cfg.input.height, cfg.input.width)
 
-    names_out = ["scores", "boxes", "drivable", "lane"]
+    names_out = ["scores", "boxes"]
+    if cfg.model.heads.segmentation.enabled:
+        names_out.extend(["drivable", "lane"])
     torch.onnx.export(
         wrapper, dummy, out_path,
         input_names=["image"], output_names=names_out,
         opset_version=opset, do_constant_folding=True,
-        dynamic_axes={"image": {0: "batch"}},
     )
     print(f"exported ONNX -> {out_path}  (opset {opset})")
     try:
         import onnx
         from onnxslim import slim
-        slim(onnx.load(out_path)).save  # noqa  (onnxslim API: slim(model) -> model)
-        print("tip: run `onnxslim model.onnx model.slim.onnx` to simplify before TRT.")
-    except Exception:
-        pass
+        onnx.save(slim(onnx.load(out_path)), out_path)
+        print("simplified ONNX graph in place with onnxslim.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: ONNX simplification skipped ({exc}).")
 
 
 if __name__ == "__main__":

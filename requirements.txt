@@ -9,7 +9,7 @@ torch>=2.3.0
 torchvision>=0.18.0
 
 # --- Foundation backbone (DINOv3) ---
-transformers>=4.53.0      # DINOv3 model classes (facebook/dinov3-*)
+transformers>=4.56.0      # DINOv3 model classes (facebook/dinov3-*)
 timm>=1.0.11              # convnext_*.dinov3_lvd1689m weights, layers
 einops>=0.8.0
 safetensors>=0.4.3
@@ -25,7 +25,7 @@ cython-bbox>=0.1.3
 motmetrics>=1.4.0        # MOTA/IDF1 evaluation
 
 # --- Datasets ---
-nuscenes-devkit>=1.1.11  # nuScenes tracking + prediction
+nuscenes-devkit>=1.2.0   # nuScenes tracking + prediction; Python 3.12 support
 # bdd100k labels parsed directly from JSON; mapillary/gtsrb via custom loaders
 
 # --- Image / data ---

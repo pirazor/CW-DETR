@@ -15,7 +15,6 @@ is available for the deploy path where a deterministic associator is preferred.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -96,13 +95,21 @@ class TrackQueryHead(nn.Module):
         object queries become the next frame's tracks.
         """
         device = query_embed.device
-        keep_track = scores[:num_track] > (self.score_thresh * 0.5)   # hysteresis
+        visible = scores[:num_track] > (self.score_thresh * 0.5)     # hysteresis
         new_det = scores[num_track:] > self.score_thresh
 
         # carry over surviving tracks
+        if len(prev) == num_track:
+            missed = prev.disappear + (~visible).to(prev.disappear.dtype)
+            keep_track = visible | (missed <= self.miss_tolerance)
+            surv_ids = prev.obj_ids[keep_track]
+            surv_disappear = torch.where(
+                visible[keep_track], torch.zeros_like(missed[keep_track]), missed[keep_track])
+        else:
+            keep_track = visible
+            surv_ids = self._new_ids(int(keep_track.sum()), device)
+            surv_disappear = torch.zeros(int(keep_track.sum()), device=device)
         surv_embed = query_embed[:num_track][keep_track]
-        surv_ids = prev.obj_ids[keep_track] if len(prev) == num_track else \
-            self._new_ids(int(keep_track.sum()), device)
         surv_ref = ref_points[:num_track][keep_track]
         surv_scores = scores[:num_track][keep_track]
 
@@ -116,11 +123,13 @@ class TrackQueryHead(nn.Module):
         ref = torch.cat([surv_ref, new_ref], 0)
         ids = torch.cat([surv_ids, new_ids], 0)
         sc = torch.cat([surv_scores, new_scores], 0)
+        disappear = torch.cat([surv_disappear, torch.zeros(new_embed.shape[0], device=device)], 0)
 
         # cap active tracks
         if embed.shape[0] > self.max_active:
             top = torch.topk(sc, self.max_active)[1]
-            embed, ref, ids, sc = embed[top], ref[top], ids[top], sc[top]
+            embed, ref, ids, sc, disappear = (
+                embed[top], ref[top], ids[top], sc[top], disappear[top])
 
         # temporal refinement of the carried embeddings
         embed = self.qim(embed)
@@ -128,4 +137,4 @@ class TrackQueryHead(nn.Module):
         return TrackInstances(
             query_embed=embed, query_pos=query_pos, ref_points=ref,
             obj_ids=ids, scores=sc,
-            disappear=torch.zeros(embed.shape[0], device=device))
+            disappear=disappear)

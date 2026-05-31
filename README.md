@@ -31,10 +31,11 @@ detection transformers — and makes two structural upgrades:
    roughly the cost of one detector — which is what makes a full perception stack run on a Jetson
    Orin Nano.
 
-> **Status:** complete, runnable reference implementation — **not yet trained**. Every module is
-> real PyTorch and the architecture is shape-verified by `tests/test_forward.py`. All accuracy /
-> latency figures in the docs are engineering targets derived from component baselines, not
-> measured CW-DETR results.
+> **Status:** repaired, runnable baseline scaffold — **not yet trained**. The offline suite
+> shape-verifies the shared trunk, heads, losses, config loader, and tracker state machinery.
+> End-to-end temporal clip training and on-device TensorRT profiling remain roadmap work. All
+> accuracy / latency figures in the docs are engineering targets derived from component baselines,
+> not measured CW-DETR results.
 
 ## Capabilities
 
@@ -62,6 +63,9 @@ detection transformers — and makes two structural upgrades:
 Full rationale, training plan, Jetson optimization, and roadmap:
 **[`docs/CW-DETR_Architecture_and_Strategy.md`](docs/CW-DETR_Architecture_and_Strategy.md)**.
 
+Measured improvement plan and acceptance gates:
+**[`docs/CW-DETR_Jetson_Improvement_Plan.md`](docs/CW-DETR_Jetson_Improvement_Plan.md)**.
+
 ## Deployment tiers
 
 | Tier | Backbone | Precision | Target board | Input | Design target |
@@ -86,7 +90,8 @@ python -m tests.test_forward --config configs/cwdetr_nano_orin.yaml
 
 # train across datasets (provide the roots you have)
 python -m cwdetr.engine.train --config configs/cwdetr_nano_orin.yaml \
-    --bdd-root /data/bdd100k --gtsrb-root /data/GTSRB --epochs 50
+    --bdd-root /data/bdd100k --nuscenes-root /data/nuscenes \
+    --gtsrb-root /data/GTSRB --epochs 50
 
 # export + build a Jetson engine (run the TensorRT build on-device)
 python -m cwdetr.export.export_onnx    --config configs/cwdetr_nano_orin.yaml --out cwdetr.onnx
@@ -143,4 +148,4 @@ backbone is required.
 ## Acknowledgements
 
 RF-DETR (Roboflow), DINOv3 (Meta AI), Deformable DETR, DINO, LW-DETR, ViTDet, MOTR/MOTRv2,
-ByteTrack, YOLOP/YOLOPv2, nuScenes, BDD100K, GTSRB, Mapillary Traffic 
+ByteTrack, YOLOP/YOLOPv2, nuScenes, BDD100K, GTSRB, Mapillary Traffic

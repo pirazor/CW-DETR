@@ -44,7 +44,12 @@ if trt is not None:
             import pycuda.driver as cuda
             import pycuda.autoinit  # noqa: F401
             self.cuda = cuda
-            self.files = sorted(glob.glob(os.path.join(calib_dir, "*")))[:max_images]
+            files = sorted(glob.glob(os.path.join(calib_dir, "*")))
+            self.files = [p for p in files
+                          if os.path.splitext(p)[1].lower() in
+                          (".jpg", ".jpeg", ".png", ".bmp", ".webp")][:max_images]
+            if not self.files:
+                raise ValueError(f"no calibration images found in {calib_dir}")
             self.h, self.w, self.cache_path = h, w, cache
             self.idx = 0
             self.device_input = cuda.mem_alloc(int(np.prod((1, 3, h, w)) * 4))
@@ -90,10 +95,12 @@ def build_engine(onnx_path, precision="fp16", calib_dir=None, hw=(384, 640),
         assert builder.platform_has_fast_int8 and calib_dir, "INT8 needs calib-dir + INT8 HW"
         config.set_flag(trt.BuilderFlag.INT8)
         config.int8_calibrator = EntropyCalibrator(calib_dir, hw[0], hw[1])
-        if fp16_fallback:
+        if fp16_fallback and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)   # let TRT keep sensitive layers in FP16
 
     serialized = builder.build_serialized_network(network, config)
+    if serialized is None:
+        raise RuntimeError("TensorRT failed to build a serialized engine")
     with open(out, "wb") as f:
         f.write(serialized)
     print(f"built TensorRT engine -> {out}  ({precision})")
@@ -107,7 +114,9 @@ if __name__ == "__main__":
     ap.add_argument("--height", type=int, default=384)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--workspace-gb", type=int, default=4)
+    ap.add_argument("--no-fp16-fallback", action="store_false", dest="fp16_fallback")
+    ap.set_defaults(fp16_fallback=True)
     ap.add_argument("--out", default="model.plan")
     a = ap.parse_args()
     build_engine(a.onnx, a.precision, a.calib_dir, (a.height, a.width),
-                 a.workspace_gb, out=a.out)
+                 a.workspace_gb, a.fp16_fallback, a.out)

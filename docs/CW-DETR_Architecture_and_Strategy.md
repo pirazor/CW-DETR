@@ -1,7 +1,7 @@
 # CW-DETR: A DINOv3 Multi-Task Perception Model for ADAS
 
 **ConnectedWise — Architecture & Strategy Whitepaper**
-*Status: design + reference implementation (untrained). Version 0.1.*
+*Status: design + repaired baseline scaffold (untrained). Version 0.2.*
 
 ---
 
@@ -30,8 +30,9 @@ Orin Nano Super, and **CW-DETR-B** (DINOv3 ViT-B/16, FP16) targeting the Jetson 
 This document explains the rationale, the architecture, the training strategy across three
 datasets, the Jetson deployment path, and a phased roadmap. **All accuracy and latency
 figures for CW-DETR in this document are engineering targets derived from the published
-numbers of its components, not measured results** — the reference implementation in this
-repository is complete but has not yet been trained.
+numbers of its components, not measured results**. The repository now carries an executable
+offline baseline and front-camera nuScenes sample assembly, but temporal clip training and
+on-device TensorRT profiling are still roadmap work.
 
 ---
 
@@ -155,7 +156,8 @@ query initialization (objectness-ranked proposals from the memory), iterative bo
 DINO `look_forward_twice`, and a `self_attn_mask` hook used by track queries and DN-DETR
 denoising. Crucially the multi-scale deformable attention is the **pure-PyTorch `grid_sample`
 implementation**, which is numerically identical to the CUDA op but exports to ONNX opset-16+ and
-runs under stock TensorRT — no custom plugin to maintain across JetPack versions.
+is available in recent TensorRT releases. The exact JetPack/TensorRT parser version must be
+validated on the target board before claiming a plugin-free deployment.
 
 ### 4.1 Heads
 
@@ -220,6 +222,10 @@ BDD100K + nuScenes detection until detection AP plateaus. Phase 2: unfreeze back
 add segmentation and sign heads. Phase 3: enable track queries (clip-based training, 2–5 frame
 clips) and the trajectory head on nuScenes. Phase 4: turn on distillation and do multi-resolution
 fine-tuning. This staged approach keeps early training stable and isolates regressions per task.
+
+The current trainer covers frame-batch detection, segmentation, signs, and distillation. The
+nuScenes loader emits track IDs and masked future trajectories, but Phase 3 still requires a
+clip sampler and a temporal training loop that propagates track queries across adjacent frames.
 
 ---
 
@@ -336,6 +342,7 @@ CW-DETR/
 
 Run the sanity tests with `python -m tests.test_forward --config configs/cwdetr_nano_orin.yaml`.
 Train with `python -m cwdetr.engine.train --config configs/cwdetr_nano_orin.yaml --bdd-root ...`.
+Use `docs/CW-DETR_Jetson_Improvement_Plan.md` for the measured optimization sequence and gates.
 
 ---
 

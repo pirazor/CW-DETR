@@ -12,15 +12,21 @@ from __future__ import annotations
 import argparse
 from unittest import mock
 
+import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 
-from cwdetr.config import load_config, CWDETRConfig
-from cwdetr.models.decoder.deformable_decoder import DeformableTransformer
+from cwdetr.config import load_config, CWDETRConfig, ModelCfg
+from cwdetr.data.transforms import RandomHFlip
+from cwdetr.engine.train import build_param_groups
+from cwdetr.models.decoder.deformable_decoder import (DeformableTransformer,
+                                                       gen_encoder_output_proposals)
 from cwdetr.models.decoder.deformable_attention import MSDeformAttn
-from cwdetr.models.heads import DetectionHead, TrajectoryHead, SignClassificationHead
-from cwdetr.models.matcher import HungarianMatcher
+from cwdetr.models.heads import (DetectionHead, SignClassificationHead,
+                                 TrackInstances, TrackQueryHead, TrajectoryHead)
 from cwdetr.models.criterion import MultiTaskCriterion
+from cwdetr.tracking.bytetrack import BYTETracker
 
 
 # --------------------------------------------------------------------------- #
@@ -61,6 +67,23 @@ def test_deform_attn():
     print("  [ok] MSDeformAttn", tuple(out.shape))
 
 
+def test_config_load_nested_dataclasses():
+    cfg = load_config("configs/cwdetr_nano_orin.yaml")
+    assert isinstance(cfg.model, ModelCfg)
+    assert cfg.model.decoder.hidden_dim == 256
+    assert cfg.model.heads.sign_classification.source_det_class == 11
+    print("  [ok] typed config load")
+
+
+def test_encoder_proposal_centers():
+    _, proposals = gen_encoder_output_proposals(torch.zeros(1, 4, 8), [(2, 2)])
+    centers = proposals.sigmoid()[0, :, :2]
+    expected = torch.tensor([[0.25, 0.25], [0.75, 0.25],
+                             [0.25, 0.75], [0.75, 0.75]])
+    assert torch.allclose(centers, expected), centers
+    print("  [ok] encoder proposal centers")
+
+
 def test_transformer_and_detection_head():
     cfg = CWDETRConfig().model.decoder
     cfg.hidden_dim = 256
@@ -88,7 +111,86 @@ def test_matcher_and_criterion():
     ]}
     losses = crit(outputs, targets)
     assert torch.isfinite(losses["total"]), losses
-    print("  [ok] matcher+criterion total=%.3f" % float(losses["total"]))
+    print("  [ok] matcher+criterion total=%.3f" % float(losses["total"].detach()))
+
+
+def test_criterion_skips_absent_segmentation_targets():
+    crit = MultiTaskCriterion(num_classes=13)
+    outputs = {
+        "detection": {
+            "pred_logits": torch.randn(1, 8, 13),
+            "pred_boxes": torch.rand(1, 8, 4),
+            "aux_outputs": [],
+        },
+        "segmentation": {
+            "drivable_logits": torch.randn(1, 3, 8, 8),
+            "lane_logits": torch.randn(1, 2, 8, 8),
+        },
+    }
+    targets = {
+        "detection": [{"labels": torch.tensor([0]), "boxes": torch.rand(1, 4)}],
+        "drivable": None,
+        "lane": None,
+    }
+    losses = crit(outputs, targets)
+    assert losses["segmentation"] is None
+    assert torch.isfinite(losses["total"])
+    print("  [ok] criterion skips absent segmentation targets")
+
+
+def test_optimizer_groups_include_criterion_parameters():
+    model = nn.Linear(4, 4)
+    crit = MultiTaskCriterion(num_classes=13, teacher_dim=8, student_dim=4)
+    groups = build_param_groups(model, 1e-3, crit)
+    grouped = {id(p) for group in groups for p in group["params"]}
+    assert all(id(p) in grouped for p in crit.parameters())
+    print("  [ok] optimizer includes criterion parameters")
+
+
+def test_track_query_miss_tolerance():
+    head = TrackQueryHead(8, score_thresh=0.5, miss_tolerance=1)
+    prev = TrackInstances(
+        query_embed=torch.zeros(1, 8),
+        query_pos=torch.zeros(1, 8),
+        ref_points=torch.rand(1, 4),
+        obj_ids=torch.tensor([7]),
+        scores=torch.tensor([0.9]),
+        disappear=torch.zeros(1),
+    )
+    missed_once = head.update(prev, torch.zeros(1, 8), torch.rand(1, 4),
+                              torch.tensor([0.0]), num_track=1)
+    assert len(missed_once) == 1
+    assert missed_once.obj_ids.tolist() == [7]
+    assert missed_once.disappear.tolist() == [1.0]
+    missed_twice = head.update(missed_once, torch.zeros(1, 8), torch.rand(1, 4),
+                               torch.tensor([0.0]), num_track=1)
+    assert len(missed_twice) == 0
+    print("  [ok] track query miss tolerance")
+
+
+def test_bytetrack_class_gating():
+    tracker = BYTETracker(high_thresh=0.5, match_thresh=0.5)
+    boxes = np.asarray([[0.0, 0.0, 10.0, 10.0]], dtype=np.float32)
+    scores = np.asarray([0.9], dtype=np.float32)
+    tracker.update(boxes, scores, np.asarray([0]))
+    tracker.update(boxes, scores, np.asarray([1]))
+    assert len(tracker.tracks) == 2
+    assert sorted(t.cls for t in tracker.tracks) == [0, 1]
+    print("  [ok] ByteTrack class gating")
+
+
+def test_image_trajectory_flip():
+    sample = {
+        "image": Image.new("RGB", (8, 4)),
+        "boxes": torch.tensor([[0.25, 0.5, 0.2, 0.2]]),
+        "sign_boxes": torch.tensor([[1.0, 0.0, 3.0, 2.0]]),
+        "future": torch.tensor([[[0.25, 0.1]]]),
+        "trajectory_space": "image",
+    }
+    flipped = RandomHFlip(1.0)(sample)
+    assert flipped["boxes"][0, 0] == 0.75
+    assert flipped["future"][0, 0, 0] == -0.25
+    print("  [ok] image trajectory flip")
 
 
 def test_trajectory_and_sign_heads():
@@ -124,8 +226,11 @@ def test_full_model_with_dummy_backbone():
 
 
 ARGS = None
-TESTS = [test_deform_attn, test_transformer_and_detection_head,
-         test_matcher_and_criterion, test_trajectory_and_sign_heads,
+TESTS = [test_deform_attn, test_config_load_nested_dataclasses,
+         test_encoder_proposal_centers, test_transformer_and_detection_head,
+         test_matcher_and_criterion, test_criterion_skips_absent_segmentation_targets,
+         test_optimizer_groups_include_criterion_parameters, test_track_query_miss_tolerance,
+         test_bytetrack_class_gating, test_image_trajectory_flip, test_trajectory_and_sign_heads,
          test_full_model_with_dummy_backbone]
 
 

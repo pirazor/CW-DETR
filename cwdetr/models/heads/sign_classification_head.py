@@ -13,8 +13,6 @@ Inference: ROIs come from boxes the detector assigned to ``source_det_class``.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 

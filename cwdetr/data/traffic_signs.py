@@ -74,7 +74,8 @@ class MapillaryTrafficSign(Dataset):
             cls = self.class_index.get(obj["label"])
             if cls is None:
                 continue
-            sboxes.append([x1, y1, x2, y2]); slabels.append(cls)
+            sboxes.append([x1, y1, x2, y2])
+            slabels.append(cls)
             dboxes.append([(x1 + x2) / 2 / w, (y1 + y2) / 2 / h, (x2 - x1) / w, (y2 - y1) / h])
         sample = {
             "image": img,
