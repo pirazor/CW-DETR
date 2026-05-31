@@ -77,13 +77,18 @@ Measured improvement plan and acceptance gates:
 
 ### ▶ Colab (easiest — no local setup, GPU optional)
 Open [`notebooks/CW_DETR_Colab.ipynb`](notebooks/CW_DETR_Colab.ipynb) in Colab (badge above). It
-installs deps, runs the shape sanity tests (no gated weights needed), and optionally builds the
-real DINOv3 model after a Hugging Face login.
+installs deps, runs the shape sanity tests (no pretrained weights needed), and optionally builds the
+real DINOv3 model after pretrained-weight access is configured.
 
 ### 💻 Local
 ```bash
 bash setup_clone.sh          # clones rf-detr + dinov3, installs deps, inspects the DINOv2 seam
-huggingface-cli login        # DINOv3 weights are gated — accept the model licenses on the Hub
+# Choose one pretrained-weight route:
+huggingface-cli login        # default Transformers backend
+# or set source: meta_hub in the YAML and provide an approved checkpoint path / URL:
+# export DINOV3_BACKBONE_WEIGHTS=/path/to/dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth
+# export DINOV3_TEACHER_WEIGHTS=/path/to/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+# Set pretrained: false with source: meta_hub only for an ungated random initialization.
 
 # sanity-check shapes end-to-end (dummy backbone, no download, runs on CPU)
 python -m tests.test_forward --config configs/cwdetr_nano_orin.yaml
@@ -141,9 +146,10 @@ CW-DETR/
 
 The CW-DETR code in this repository is released under **Apache-2.0**. It builds on RF-DETR
 (Nano–Large: Apache-2.0) and the **DINOv3** weights, which are distributed under **Meta's DINOv3
-license** (gated on Hugging Face; commercial use permitted under its terms). Review the DINOv3
-license before shipping a product; the backbone interface is swappable if a fully-permissive
-backbone is required.
+license**. Meta's source repository is public, while pretrained checkpoint access requires
+accepting Meta's terms through either the official repository instructions or Hugging Face.
+Review the DINOv3 license before shipping a product; the backbone interface is swappable if a
+fully-permissive backbone is required.
 
 ## Acknowledgements
 

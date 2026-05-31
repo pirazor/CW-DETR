@@ -1,6 +1,6 @@
 """Offline shape/forward sanity tests for CW-DETR.
 
-DINOv3 weights are gated and heavy, so the full-model test swaps in a DummyBackbone
+DINOv3 pretrained weights are access-controlled and heavy, so the full-model test swaps in a DummyBackbone
 (via mock) producing correctly-shaped random feature maps. Every other module is
 exercised with synthetic tensors. Run either as pytest or directly:
 
@@ -10,6 +10,7 @@ exercised with synthetic tensors. Run either as pytest or directly:
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -17,12 +18,13 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from cwdetr.config import load_config, CWDETRConfig, ModelCfg
+from cwdetr.config import BackboneCfg, load_config, CWDETRConfig, ModelCfg
 from cwdetr.data.transforms import RandomHFlip
 from cwdetr.engine.train import build_param_groups
 from cwdetr.models.decoder.deformable_decoder import (DeformableTransformer,
                                                        gen_encoder_output_proposals)
 from cwdetr.models.decoder.deformable_attention import MSDeformAttn
+from cwdetr.models.backbone.dinov3_backbone import DINOv3Backbone
 from cwdetr.models.heads import (DetectionHead, SignClassificationHead,
                                  TrackInstances, TrackQueryHead, TrajectoryHead)
 from cwdetr.models.criterion import MultiTaskCriterion
@@ -46,6 +48,19 @@ class DummyBackbone(nn.Module):
 
     def teacher_features(self, x):
         return None
+
+
+class DummyMetaHubEncoder(nn.Module):
+    """Official Meta-repo stand-in exposing the intermediate-layer API."""
+
+    channels = [96, 192, 384, 768]
+
+    def get_intermediate_layers(self, x, n=1, reshape=False):
+        stages = list(range(4 - n, 4)) if isinstance(n, int) else list(n)
+        b, _, h, w = x.shape
+        return tuple(torch.randn(b, self.channels[stage],
+                                 h // (2 ** (stage + 2)), w // (2 ** (stage + 2)))
+                     for stage in stages)
 
 
 def _synthetic_srcs(b=2, c=256, base_hw=(48, 80)):
@@ -73,6 +88,36 @@ def test_config_load_nested_dataclasses():
     assert cfg.model.decoder.hidden_dim == 256
     assert cfg.model.heads.sign_classification.source_det_class == 11
     print("  [ok] typed config load")
+
+
+def test_meta_hub_backbone_loader():
+    cfg = BackboneCfg(
+        source="meta_hub", meta_model="dinov3_convnext_tiny",
+        weights="checkpoint.pth", out_indices=[1, 2, 3],
+        out_channels=[192, 384, 768], out_strides=[8, 16, 32])
+    factory = mock.Mock(return_value=DummyMetaHubEncoder())
+    module = SimpleNamespace(dinov3_convnext_tiny=factory)
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        backbone = DINOv3Backbone(cfg)
+        feats = backbone(torch.randn(1, 3, 64, 96))
+    factory.assert_called_once_with(pretrained=True, weights="checkpoint.pth")
+    assert [tuple(f.shape) for f in feats] == [
+        (1, 192, 8, 12), (1, 384, 4, 6), (1, 768, 2, 3)]
+    backbone.teacher = DummyMetaHubEncoder()
+    backbone._teacher_mode = "meta_hub"
+    assert backbone.teacher_features(torch.randn(1, 3, 64, 96)).shape == (1, 768, 2, 3)
+    print("  [ok] official Meta repository backbone")
+
+
+def test_meta_hub_random_init_without_weights():
+    factory = mock.Mock(return_value=DummyMetaHubEncoder())
+    module = SimpleNamespace(dinov3_convnext_tiny=factory)
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        DINOv3Backbone(BackboneCfg(source="meta_hub", pretrained=False))
+    factory.assert_called_once_with(pretrained=False)
+    print("  [ok] official Meta repository random init")
 
 
 def test_encoder_proposal_centers():
@@ -226,7 +271,8 @@ def test_full_model_with_dummy_backbone():
 
 
 ARGS = None
-TESTS = [test_deform_attn, test_config_load_nested_dataclasses,
+TESTS = [test_deform_attn, test_config_load_nested_dataclasses, test_meta_hub_backbone_loader,
+         test_meta_hub_random_init_without_weights,
          test_encoder_proposal_centers, test_transformer_and_detection_head,
          test_matcher_and_criterion, test_criterion_skips_absent_segmentation_targets,
          test_optimizer_groups_include_criterion_parameters, test_track_query_miss_tolerance,

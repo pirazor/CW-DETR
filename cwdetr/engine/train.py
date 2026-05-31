@@ -149,8 +149,8 @@ def main():
     for epoch in range(args.epochs):
         train_one_epoch(model, criterion, loader, optim, scaler, device, cfg, epoch)
         sched.step()
-        # The frozen distillation teacher is loaded from Hugging Face and does
-        # not belong in every checkpoint.
+        # The frozen distillation teacher is loaded from its configured source
+        # and does not belong in every checkpoint.
         model_state = {k: v for k, v in model.state_dict().items()
                        if not k.startswith("backbone.teacher.")}
         ckpt = {"model": model_state, "criterion": criterion.state_dict(),

@@ -52,12 +52,23 @@ grep -rni --include='*.py' -e 'deformable' -e 'class LWDETR' -e 'MSDeform' \
 
 echo "==> [4/4] DINOv3 weights note"
 cat <<'EOF'
-   DINOv3 backbones are gated on the Hugging Face Hub. Before first run:
+   The official facebookresearch/dinov3 source repo is public. Pretrained
+   checkpoints still require accepting Meta's access terms. Choose either:
+
+   A) Hugging Face Transformers backend (default config):
        huggingface-cli login
-   then accept the license at:
+      then accept the model terms at:
        https://huggingface.co/facebook/dinov3-convnext-tiny-pretrain-lvd1689m
        https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m
-   CW-DETR pulls them automatically via transformers.AutoModel on first use.
+
+   B) Official Meta repository backend:
+      request checkpoint URLs from:
+       https://github.com/facebookresearch/dinov3#pretrained-models
+      then set source: meta_hub in the YAML config and provide local checkpoint
+      paths with weights / teacher_weights, or export:
+       DINOV3_BACKBONE_WEIGHTS=/path/or/approved/url
+       DINOV3_TEACHER_WEIGHTS=/path/or/approved/url
+      Set pretrained: false only if an ungated random initialization is desired.
 
    Sanity check the install:
        python -m tests.test_forward --config configs/cwdetr_nano_orin.yaml

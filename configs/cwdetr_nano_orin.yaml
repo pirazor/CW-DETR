@@ -15,7 +15,14 @@ model:
   hidden_dim: 256
   backbone:
     type: dinov3_convnext            # dinov3_convnext | dinov3_vit
+    source: huggingface              # huggingface | meta_hub
     hf_name: facebook/dinov3-convnext-tiny-pretrain-lvd1689m
+    # Official Meta backend alternative:
+    # source: meta_hub
+    # meta_repo: third_party/dinov3
+    # meta_model: dinov3_convnext_tiny
+    # weights: /path/to/dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth
+    # pretrained: false               # architecture-only, no checkpoint access
     # ConvNeXt-Tiny stage channels [96,192,384,768] @ strides [4,8,16,32].
     out_indices: [1, 2, 3]           # -> channels [192,384,768] @ strides [8,16,32]
     out_channels: [192, 384, 768]
@@ -24,6 +31,8 @@ model:
     drop_path_rate: 0.1
     gram_anchor_distill: true        # use frozen DINOv3 ViT teacher for feature distill
     teacher_hf_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    # For source: meta_hub, set teacher_meta_model: dinov3_vitb16 and either
+    # teacher_weights here or DINOV3_TEACHER_WEIGHTS in the environment.
 
   projector:                         # single/multi-scale -> unified pyramid (C2f-style)
     type: c2f_multiscale

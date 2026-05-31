@@ -111,10 +111,12 @@ teacher's representational quality into the tiny edge backbone without any extra
 implements this as a cosine feature-distillation loss (`criterion.loss_distill`) gated by the
 `gram_anchor_distill` config flag.
 
-**License note.** RF-DETR Nano–Large are Apache-2.0; DINOv3 weights are released under Meta's
-DINOv3 license (gated on Hugging Face, commercial use permitted under its terms). Confirm the
-DINOv3 license terms apply to your product before shipping; the architecture itself is
-backbone-agnostic and can fall back to a permissively-licensed ConvNeXt if required.
+**License note.** RF-DETR Nano–Large are Apache-2.0; DINOv3 code and weights are released under
+Meta's DINOv3 license. Meta's source repository is public, but pretrained checkpoint access still
+requires accepting Meta's terms. CW-DETR supports both the official Meta repository backbone
+factories with an approved checkpoint URL or local file and the Hugging Face Transformers path. Confirm the DINOv3
+license terms apply to your product before shipping; the architecture itself is backbone-agnostic
+and can fall back to a permissively-licensed ConvNeXt if required.
 
 ---
 
@@ -137,13 +139,17 @@ dominate FLOPs and latency; every head is a thin module reading either the share
 embeddings or the shared dense feature maps. Adding a task therefore adds milliwatts, not a
 second network. This is the difference between "five models" and "one perception model."
 
-**Backbone (`models/backbone/dinov3_backbone.py`).** Loads DINOv3 via `transformers.AutoBackbone`
-(clean multi-scale `feature_maps`) with an `AutoModel` fallback. For the ConvNeXt tier it returns
-the native {8,16,32}-stride pyramid. For the ViT tier it takes the stride-16 patch grid (dropping
-the CLS + 4 register tokens, per the confirmed `[CLS|registers|patches]` token layout) and lifts
-it to a three-level pyramid with a ViTDet "simple feature pyramid." Optional windowed attention
-(`windowed_attention.py`) restricts most ViT blocks to local windows, RF-DETR style, to keep cost
-linear in token count.
+**Backbone (`models/backbone/dinov3_backbone.py`).** Supports two interchangeable loaders:
+`source: huggingface` uses `transformers.AutoBackbone` with an `AutoModel` fallback, while
+`source: meta_hub` uses the cloned official `facebookresearch/dinov3` repo plus an approved
+checkpoint URL or local file. Setting `pretrained: false` permits an ungated architecture-only
+Meta-repository load for experiments, but it gives up the pretrained representation. For the ConvNeXt
+tier the wrapper returns the native {8,16,32}-stride pyramid. For the ViT tier it takes the
+stride-16 patch grid (dropping the CLS + 4 register tokens, per the confirmed
+`[CLS|registers|patches]` token layout) and lifts it to a three-level pyramid with a ViTDet
+"simple feature pyramid." Optional windowed attention (`windowed_attention.py`) restricts most
+Hugging Face ViT blocks to local windows, RF-DETR style, to keep cost linear in token count; the
+official Meta ViT backend currently stays on its native global-attention path.
 
 **Projector (`models/projector.py`).** A light PAN-style neck with C2f fusion blocks unifies the
 backbone maps to a common width (256 for N, 384 for B) and emits exactly the number of feature

@@ -31,6 +31,10 @@ which the projector then unifies to ``hidden_dim`` channels.
 """
 from __future__ import annotations
 
+import importlib
+import os
+from pathlib import Path
+import sys
 from typing import List, Optional
 
 import torch
@@ -96,14 +100,21 @@ class DINOv3Backbone(nn.Module):
 
         # Optional frozen teacher for Gram-anchored feature distillation.
         self.teacher: Optional[nn.Module] = None
-        if cfg.gram_anchor_distill and cfg.teacher_hf_name:
-            self._load_teacher(cfg.teacher_hf_name)
+        if cfg.gram_anchor_distill:
+            self._load_teacher(cfg)
 
     # ----- loading -------------------------------------------------------- #
     def _load_encoder(self, cfg: BackboneCfg):
-        """Prefer transformers.AutoBackbone (clean multi-scale .feature_maps);
-        fall back to AutoModel + manual token reshape for ViT."""
+        """Load from Hugging Face Transformers or Meta's official repository."""
         self._mode = None
+        if cfg.source == "meta_hub":
+            self.encoder = self._load_meta_model(
+                cfg.meta_repo, cfg.meta_model or self._default_meta_model(cfg.type),
+                cfg.weights or os.getenv("DINOV3_BACKBONE_WEIGHTS"),
+                pretrained=cfg.pretrained, weights_hint="DINOV3_BACKBONE_WEIGHTS")
+            self._mode = "meta_hub"
+            return
+
         try:
             from transformers import AutoBackbone
             self.encoder = AutoBackbone.from_pretrained(
@@ -119,7 +130,7 @@ class DINOv3Backbone(nn.Module):
             self.encoder = AutoModel.from_pretrained(cfg.hf_name)
             self._mode = "automodel"
 
-        if cfg.windowed_attention and self.kind == "dinov3_vit":
+        if cfg.windowed_attention and self.kind == "dinov3_vit" and self._mode != "meta_hub":
             # Patch selected ViT blocks to compute attention within local windows
             # (RF-DETR / ViTDet scheme). See windowed_attention.convert_to_windowed.
             try:
@@ -133,9 +144,55 @@ class DINOv3Backbone(nn.Module):
                 print(f"[backbone] windowed-attention patch skipped ({exc}); "
                       f"using global attention.")
 
-    def _load_teacher(self, teacher_hf_name: str):
-        from transformers import AutoModel
-        self.teacher = AutoModel.from_pretrained(teacher_hf_name)
+    @staticmethod
+    def _default_meta_model(kind: str) -> str:
+        return "dinov3_convnext_tiny" if kind == "dinov3_convnext" else "dinov3_vitb16"
+
+    @staticmethod
+    def _resolve_meta_repo(meta_repo: str) -> str:
+        repo = Path(os.getenv("DINOV3_REPO", meta_repo)).expanduser()
+        if not repo.is_absolute():
+            repo = Path(__file__).resolve().parents[3] / repo
+        if not (repo / "hubconf.py").is_file():
+            raise FileNotFoundError(
+                f"DINOv3 repo not found at {repo}. Run setup_clone.sh or set DINOV3_REPO.")
+        return str(repo.resolve())
+
+    @classmethod
+    def _load_meta_model(cls, meta_repo: str, meta_model: str,
+                         weights: Optional[str], pretrained: bool = True,
+                         weights_hint: str = "DINOV3_BACKBONE_WEIGHTS") -> nn.Module:
+        if pretrained and not weights:
+            raise ValueError(
+                "Meta repository backend requires an approved checkpoint path or URL. "
+                f"Set weights in the config or {weights_hint}, or use pretrained: false.")
+        kwargs = {"pretrained": pretrained}
+        if weights:
+            kwargs["weights"] = weights
+        repo = cls._resolve_meta_repo(meta_repo)
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        backbones = importlib.import_module("dinov3.hub.backbones")
+        try:
+            factory = getattr(backbones, meta_model)
+        except AttributeError as exc:
+            raise ValueError(f"Unsupported Meta DINOv3 backbone: {meta_model}") from exc
+        return factory(**kwargs)
+
+    def _load_teacher(self, cfg: BackboneCfg):
+        teacher_source = cfg.teacher_source or cfg.source
+        if teacher_source == "meta_hub":
+            weights = cfg.teacher_weights or os.getenv("DINOV3_TEACHER_WEIGHTS")
+            self.teacher = self._load_meta_model(
+                cfg.meta_repo, cfg.teacher_meta_model, weights,
+                weights_hint="DINOV3_TEACHER_WEIGHTS")
+            self._teacher_mode = "meta_hub"
+        else:
+            if not cfg.teacher_hf_name:
+                raise ValueError("teacher_hf_name is required for Hugging Face distillation")
+            from transformers import AutoModel
+            self.teacher = AutoModel.from_pretrained(cfg.teacher_hf_name)
+            self._teacher_mode = "huggingface"
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad_(False)
@@ -169,6 +226,9 @@ class DINOv3Backbone(nn.Module):
         hp, wp = h // self.patch_size, w // self.patch_size
 
         if self.kind == "dinov3_convnext":
+            if self._mode == "meta_hub":
+                return list(self.encoder.get_intermediate_layers(
+                    x, n=self.cfg.out_indices, reshape=True))
             if self._mode == "autobackbone":
                 feats = list(self.encoder(x).feature_maps)
             else:
@@ -177,16 +237,19 @@ class DINOv3Backbone(nn.Module):
             return feats
 
         # ----- ViT path: single stride-16 map -> simple feature pyramid ---- #
-        if self.cfg.windowed_attention:
+        if self.cfg.windowed_attention and self._mode != "meta_hub":
             from cwdetr.models.backbone.windowed_attention import set_grid_hw
             set_grid_hw(self.encoder, hp, wp)
         if self._mode == "autobackbone":
             # Use the last requested layer's map (already [B, C, hp, wp]).
             fmap = self.encoder(x).feature_maps[-1]
-        else:
+        elif self._mode == "automodel":
             out = self.encoder(x, output_hidden_states=True)
             tokens = out.hidden_states[self.cfg.out_layer_indices[-1]]
             fmap = self._vit_tokens_to_map(tokens, hp, wp)
+        else:
+            fmap = self.encoder.get_intermediate_layers(
+                x, n=self.cfg.out_layer_indices, reshape=True)[-1]
         return self.simple_fpn(fmap)
 
     @torch.no_grad()
@@ -195,6 +258,8 @@ class DINOv3Backbone(nn.Module):
         Used by the Gram-anchored feature-distillation loss (training only)."""
         if self.teacher is None:
             return None
+        if self._teacher_mode == "meta_hub":
+            return self.teacher.get_intermediate_layers(x, n=1, reshape=True)[-1]
         h, w = x.shape[-2:]
         hp, wp = h // self.patch_size, w // self.patch_size
         out = self.teacher(x, output_hidden_states=True)

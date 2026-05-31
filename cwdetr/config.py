@@ -27,7 +27,16 @@ class InputCfg:
 @dataclass
 class BackboneCfg:
     type: str = "dinov3_convnext"          # dinov3_convnext | dinov3_vit
+    source: str = "huggingface"            # huggingface | meta_hub
+    # Hugging Face Transformers backend
     hf_name: str = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"
+    # Official facebookresearch/dinov3 repository backend. ``weights`` may be a
+    # local checkpoint or an approved Meta URL. Environment overrides:
+    # DINOV3_REPO and DINOV3_BACKBONE_WEIGHTS.
+    meta_repo: str = "third_party/dinov3"
+    meta_model: Optional[str] = None
+    pretrained: bool = True
+    weights: Optional[str] = None
     # ConvNeXt path
     out_indices: List[int] = field(default_factory=lambda: [1, 2, 3])
     out_channels: List[int] = field(default_factory=lambda: [192, 384, 768])
@@ -47,6 +56,9 @@ class BackboneCfg:
     drop_path_rate: float = 0.1
     gram_anchor_distill: bool = False
     teacher_hf_name: Optional[str] = None
+    teacher_source: Optional[str] = None     # defaults to source
+    teacher_meta_model: str = "dinov3_vitb16"
+    teacher_weights: Optional[str] = None    # or DINOV3_TEACHER_WEIGHTS
 
 
 @dataclass
@@ -206,6 +218,10 @@ def validate_config(cfg: CWDETRConfig) -> None:
         raise ValueError("decoder num_feature_levels must match projector num_levels")
     if len(b.out_channels) != len(b.out_strides):
         raise ValueError("backbone out_channels and out_strides must have the same length")
+    if b.source not in ("huggingface", "meta_hub"):
+        raise ValueError("backbone source must be 'huggingface' or 'meta_hub'")
+    if b.teacher_source not in (None, "huggingface", "meta_hub"):
+        raise ValueError("teacher_source must be 'huggingface', 'meta_hub', or null")
     if len(b.out_channels) > d.num_feature_levels:
         raise ValueError("backbone cannot emit more levels than the decoder consumes")
     if b.out_strides and any(
