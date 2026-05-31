@@ -247,6 +247,7 @@ def test_trajectory_and_sign_heads():
     rois = torch.tensor([[0, 10, 10, 60, 60], [0, 100, 80, 160, 140]], dtype=torch.float32)
     out = sign(feat, rois, feat_stride=8)
     assert out.shape == (2, 43), out.shape
+    assert sum(p.numel() for p in sign.parameters()) < 100_000
     print("  [ok] trajectory + sign heads")
 
 

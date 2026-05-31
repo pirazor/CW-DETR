@@ -189,7 +189,8 @@ detector finds *where* signs are, and this head ROI-aligns crops from a shared f
 decide *which* sign (GTSRB-43 on the Nano tier, Mapillary ~400 on the Base tier). Decoupling
 "where" from "what" keeps the detector's class space tiny and stable while still delivering
 fine-grained signs, and it reuses backbone features so the extra cost is a small ROI head, not a
-second classifier network.
+second classifier network. The ROI head uses a channel bottleneck, depthwise-separable residual
+blocks, and pooled spatial features so it remains lightweight on the Nano tier.
 
 **Trajectory** (`heads/trajectory_head.py`) conditions on a tracked object's decoder embedding and
 its short motion history (from the tracker) to predict `num_modes` future paths plus a probability
