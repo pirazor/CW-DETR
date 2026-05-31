@@ -268,4 +268,6 @@ class DeformableTransformer(nn.Module):
             "init_reference": init_reference,  # [B, Lq, 2 or 4]
             "inter_references": inter_ref,     # [n_layers, B, Lq, 2 or 4]
             "memory": src_flatten,             # [B, sum(HW), C]  (for seg head)
-   
+            "spatial_shapes": spatial_shapes,
+            "enc_outputs": enc_out,
+        }
