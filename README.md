@@ -68,6 +68,9 @@ Full rationale, training plan, Jetson optimization, and roadmap:
 Pre-training correctness and readiness gates:
 **[`docs/CW-DETR_Training_Readiness_Plan.md`](docs/CW-DETR_Training_Readiness_Plan.md)**.
 
+Reproducible verification evidence and pending hardware/data gates:
+**[`docs/CW-DETR_Training_Readiness_Report.md`](docs/CW-DETR_Training_Readiness_Report.md)**.
+
 Measured improvement plan and acceptance gates:
 **[`docs/CW-DETR_Jetson_Improvement_Plan.md`](docs/CW-DETR_Jetson_Improvement_Plan.md)**.
 

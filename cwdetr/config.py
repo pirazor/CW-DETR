@@ -93,7 +93,11 @@ class DecoderCfg:
     dec_n_points: int = 4
     two_stage: bool = True
     look_forward_twice: bool = True
+    dn_enabled: bool = False
+    dn_num_groups: int = 5
+    label_noise_ratio: float = 0.2
     box_noise_scale: float = 1.0
+    dn_loss_weight: float = 1.0
 
 
 @dataclass
@@ -237,6 +241,14 @@ def validate_config(cfg: CWDETRConfig) -> None:
         raise ValueError("decoder hidden_dim must be divisible by num_heads")
     if d.num_feature_levels != m.projector.num_levels:
         raise ValueError("decoder num_feature_levels must match projector num_levels")
+    if d.dn_enabled and not d.two_stage:
+        raise ValueError("DN-DETR currently requires the two-stage decoder")
+    if d.dn_num_groups <= 0:
+        raise ValueError("decoder dn_num_groups must be positive")
+    if not 0 <= d.label_noise_ratio <= 1:
+        raise ValueError("decoder label_noise_ratio must be in [0, 1]")
+    if d.box_noise_scale < 0 or d.dn_loss_weight < 0:
+        raise ValueError("decoder box_noise_scale and dn_loss_weight must be non-negative")
     if len(b.out_channels) != len(b.out_strides):
         raise ValueError("backbone out_channels and out_strides must have the same length")
     if b.type not in ("dinov3_convnext", "dinov3_vit"):
