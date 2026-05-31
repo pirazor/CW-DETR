@@ -6,10 +6,11 @@ that doc's experiment order assumes the model trains all intended signals and th
 Today neither is true. Work the tasks below in order; each is scoped for a coding agent and ends
 with an explicit acceptance check.
 
-> Status of the codebase: correct forward graph for **detection + segmentation + sign**; tracking
-> and trajectory heads are present but receive **no gradient** from the shipped trainer; there is
-> **no evaluation/metrics code**; the **two-stage proposal head is unsupervised**; DN-DETR
-> denoising is configured but unimplemented.
+> Status of the codebase: the detection + segmentation + sign shape graph runs, but it is not yet
+> training-ready. The **two-stage proposal head is unsupervised**, GTSRB crop samples pollute the
+> detector, the ViT backbone path has unsafe feature-selection assumptions, and there is **no
+> evaluation/metrics code**. Tracking and trajectory heads are scaffolding only: the shipped trainer
+> gives them no gradient. DN-DETR denoising is configured but unimplemented.
 
 ## Guiding rules for the implementer
 1. **One task = one PR.** Keep the existing `tests/test_forward.py` green at every step.
@@ -78,9 +79,15 @@ metric dict keys/shapes.
 reconciles channels but **not strides**; a wrong stage→stride mapping yields plausibly-shaped but
 semantically wrong features with no crash. DINOv3 HF support is also version-sensitive and gated.
 
-**Change.** After the first real forward in `DINOv3Backbone`, assert each returned map's spatial
-size equals `H/stride, W/stride` for the configured `out_strides`; raise a clear error otherwise.
-Pin `transformers`/`timm` versions in `requirements.txt`. Add a short README note on weight access.
+**Change.**
+- Separate ConvNeXt encoder channels from ViT simple-FPN output widths. Do not overwrite ViT FPN
+  widths from `AutoBackbone.channels`.
+- Make the ViT path consume the intended final DINOv3 map consistently across Hugging Face and Meta
+  backends. The current Hugging Face path incorrectly reuses ConvNeXt `out_indices`.
+- After each real forward in `DINOv3Backbone`, assert returned feature count, channels, and spatial
+  size (`H/stride, W/stride`) against the configured contract; raise a clear error otherwise.
+- Pin the verified DINOv3 dependency line in `requirements.txt`. Add a short README note on weight
+  access.
 
 **Acceptance.** A guard test (skipped if weights unavailable) confirms the assertion fires on a
 deliberately wrong stride config and passes on the correct one.
@@ -90,12 +97,36 @@ deliberately wrong stride config and passes on the correct one.
 full-frame `traffic_sign` detection box for an upscaled 32px crop. This trains the *detector* on a
 distorted distribution.
 
-**Change.** For crop-style sign datasets, emit an **empty** detection target (keep only
-`sign_boxes`/`sign_labels` for the sign head), or add a per-sample `train_detection: False` flag the
-criterion respects. Keep Mapillary (real in-context boxes) contributing to detection.
+**Change.** For crop-style sign datasets, emit an empty detection target and a per-sample
+`train_detection: False` flag that the criterion respects. Empty boxes alone are insufficient:
+focal classification would still train every detector query as background. Keep Mapillary (real
+in-context boxes) contributing to detection. Reject incompatible GTSRB + Mapillary fine-label
+taxonomies unless an explicit unified mapping is supplied.
 
 **Acceptance.** Test: a GTSRB-style sample produces zero detection-loss contribution but a non-zero
 sign-loss contribution.
+
+### A5 — Disable unsafe ViT windowing until it is RoPE-correct
+**Problem.** The best-effort Hugging Face window wrapper can silently fail to locate the nested ViT
+blocks and does not correctly recompute DINOv3 rotary positions for local windows.
+
+**Change.** Default `windowed_attention: false` and fail clearly if it is enabled. Reintroduce it in
+a separate measured optimization PR only after a RoPE-correct implementation exists.
+
+### A6 — Keep the frozen distillation teacher frozen
+**Problem.** Calling `model.train()` recursively puts the teacher back into training mode even though
+its parameters are frozen. DINOv3 training-time positional augmentation would make the target drift.
+
+**Change.** Override backbone training-mode propagation so the teacher remains in eval mode. Derive
+the teacher channel width from the loaded teacher rather than hard-coding `768`. Disable distillation
+for the first detector baseline; add it only as a measured ablation.
+
+### A7 — Disable unfinished temporal defaults
+**Problem.** Learned tracking and trajectory heads default on even though training is not wired.
+
+**Change.** Default learned tracking and trajectory heads off in baseline configs. Retain ByteTrack
+as the deploy baseline. Treat the temporal modules as experimental scaffolding until clip-based
+supervision, differentiable propagation, duplicate handling, and ID-aligned trajectory targets land.
 
 ---
 
@@ -127,10 +158,9 @@ Seed `random`/`numpy`/`torch`; make `MixedBatchSampler` epoch-seeded
 ### C1 — Implement (or remove) DN-DETR denoising
 **Problem.** `box_noise_scale` is configured and docstrings cite denoising + the `self_attn_mask`
 hook, but it is **unimplemented**: `self_attn_mask` is always `None`, no DN groups, no DN loss.
-**Change.** Either (a) implement DN-DETR: build noised GT query groups, the block-diagonal
-`self_attn_mask` that isolates them, and a DN reconstruction loss; or (b) delete the dead config +
-docstring claims and budget a longer schedule. **(a) is recommended** — with A1 it restores the
-"fast convergence" the design depends on.
+**Change.** Implement DN-DETR after the measurable baseline lands: build noised GT query groups, the
+block-diagonal `self_attn_mask` that isolates them, and direct reconstruction loss. Keep it
+config-gated and default-off until its ablation passes.
 **Acceptance.** With DN on, detection mAP reaches a fixed threshold in materially fewer epochs than
 with DN off (record the ablation).
 
@@ -138,8 +168,9 @@ with DN off (record the ablation).
 
 ## Workstream D — Temporal enablement (defer until detection+seg+sign baseline converges)
 
-The nuScenes loader **already provides** `track_ids`, `future`, `future_mask` — so this is wiring,
-not data work.
+The nuScenes loader already provides `track_ids`, `future`, `future_mask`, but temporal readiness is
+more than wiring: it also needs clip sampling, differentiable propagation, duplicate handling, and
+ID-aligned trajectory targets.
 
 ### D1 — Clip sampler + temporal training loop
 Add a 2–5 frame clip sampler; in the loop, run frame *t*, build `TrackInstances` via
@@ -171,6 +202,14 @@ INT8; record whether `GridSample` parses, the layer profile, and FPS. Feed resul
 Jetson plan's speed workstream.
 **Acceptance.** A recorded `trtexec` profile (or a documented failure mode + mitigation) for the
 untrained graph on-device.
+
+### E2 — Export the sign-classification sidecar
+**Problem.** The current TensorRT graph exports detection + segmentation only, so the advertised
+sign-classification runtime disappears after deployment.
+
+**Change.** Optionally expose the finest projector feature map from the core static graph. Export a
+separate static-capacity FP16 sign-classification sidecar that consumes the feature map and padded
+ROIs. Invoke it only when coarse traffic-sign detections exist.
 
 ---
 
