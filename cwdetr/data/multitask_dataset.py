@@ -61,38 +61,50 @@ class ConcatMultiTaskDataset(Dataset):
 
 class MixedBatchSampler(Sampler):
     def __init__(self, concat: ConcatMultiTaskDataset, batch_size: int,
-                 weights: List[float] = None, drop_last: bool = True):
+                 weights: List[float] = None, drop_last: bool = True,
+                 seed: int = 0, rank: int = 0, world_size: int = 1):
         self.concat = concat
         self.bs = batch_size
         self.drop_last = drop_last
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
         n = len(concat.datasets)
         self.weights = weights or [1.0] * n
 
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
     def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
         # build per-dataset shuffled batch queues
         queues = []
         for di, length in enumerate(self.concat.lengths):
             idx = [self.concat.offsets[di] + i for i in range(length)]
-            random.shuffle(idx)
+            rng.shuffle(idx)
             batches = [idx[i:i + self.bs] for i in range(0, length, self.bs)]
             if self.drop_last and batches and len(batches[-1]) < self.bs:
                 batches.pop()
             queues.append(batches)
         total = sum(len(q) for q in queues)
         # interleave datasets by weight
+        ordered = []
         while total > 0:
-            di = random.choices(range(len(queues)),
-                                weights=[self.weights[i] * len(queues[i]) for i in range(len(queues))]
-                                )[0] if any(queues) else None
+            di = rng.choices(range(len(queues)),
+                             weights=[self.weights[i] * len(queues[i]) for i in range(len(queues))]
+                             )[0] if any(queues) else None
             if di is None or not queues[di]:
                 if not any(queues):
                     break
                 continue
-            yield queues[di].pop()
+            ordered.append(queues[di].pop())
             total -= 1
+        yield from ordered[self.rank::self.world_size]
 
     def __len__(self):
-        return sum(max(0, length // self.bs) for length in self.concat.lengths)
+        total = sum(max(0, length // self.bs) for length in self.concat.lengths)
+        return max(0, (total + self.world_size - 1 - self.rank) // self.world_size)
 
 
 def collate_fn(batch: List[Dict]) -> Dict:

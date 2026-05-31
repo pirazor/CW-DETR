@@ -25,6 +25,20 @@ class InputCfg:
 
 
 @dataclass
+class AugmentationCfg:
+    enabled: bool = True
+    scale_min: float = 0.8
+    scale_max: float = 1.2
+    crop_prob: float = 0.5
+    hflip_prob: float = 0.5
+    photometric_prob: float = 0.8
+    brightness: float = 0.2
+    contrast: float = 0.2
+    saturation: float = 0.2
+    hue: float = 0.05
+
+
+@dataclass
 class BackboneCfg:
     type: str = "dinov3_convnext"          # dinov3_convnext | dinov3_vit
     source: str = "huggingface"            # huggingface | meta_hub
@@ -157,6 +171,7 @@ class CWDETRConfig:
     name: str = "cwdetr-nano"
     description: str = ""
     input: InputCfg = field(default_factory=InputCfg)
+    augmentation: AugmentationCfg = field(default_factory=AugmentationCfg)
     model: ModelCfg = field(default_factory=ModelCfg)
     deploy: DeployCfg = field(default_factory=DeployCfg)
 
@@ -208,8 +223,14 @@ def validate_config(cfg: CWDETRConfig) -> None:
     m = cfg.model
     b = m.backbone
     d = m.decoder
+    aug = cfg.augmentation
     if cfg.input.height <= 0 or cfg.input.width <= 0:
         raise ValueError("input height and width must be positive")
+    if not 0 < aug.scale_min <= aug.scale_max:
+        raise ValueError("augmentation scale_min and scale_max must be positive and ordered")
+    for name in ("crop_prob", "hflip_prob", "photometric_prob"):
+        if not 0 <= getattr(aug, name) <= 1:
+            raise ValueError(f"augmentation {name} must be in [0, 1]")
     if m.hidden_dim != m.projector.hidden_dim or m.hidden_dim != d.hidden_dim:
         raise ValueError("model, projector, and decoder hidden_dim values must match")
     if d.hidden_dim % d.num_heads:

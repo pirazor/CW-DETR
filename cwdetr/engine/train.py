@@ -1,135 +1,205 @@
-"""Multi-task training loop for CW-DETR.
-
-Scaffold trainer: param groups (the pretrained DINOv3 backbone gets a 10x lower
-LR than the freshly-initialised heads/decoder), AMP, gradient clipping, the
-Gram-anchored distillation hookup, and checkpointing. Distributed training is
-left to ``torchrun`` + DDP wrapping (one line, marked below).
-
-Run:
-    python -m cwdetr.engine.train --config configs/cwdetr_nano_orin.yaml \
-        --bdd-root /data/bdd100k --gtsrb-root /data/GTSRB --epochs 50
-"""
+"""Multi-task training loop for the measurable CW-DETR baseline."""
 from __future__ import annotations
 
 import argparse
 import os
+from typing import Optional
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from cwdetr.config import config_to_dict, load_config
-from cwdetr.models.cwdetr import build_cwdetr
+from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
+                         MixedBatchSampler, NuScenesSequences, build_transforms,
+                         collate_fn)
+from cwdetr.engine.evaluate import build_eval_dataset, evaluate_loader, print_metrics
+from cwdetr.engine.utils import (ModelEMA, build_warmup_cosine_scheduler,
+                                 make_worker_init_fn, seed_everything,
+                                 targets_to_device, unwrap_module)
 from cwdetr.models.criterion import MultiTaskCriterion
-from cwdetr.data import (BDD100KDataset, GTSRBSigns, NuScenesSequences,
-                         ConcatMultiTaskDataset, MixedBatchSampler, collate_fn,
-                         build_transforms)
+from cwdetr.models.cwdetr import build_cwdetr
 
 
 def build_param_groups(model, base_lr, criterion=None, backbone_lr_mult=0.1, wd=1e-4):
     backbone, rest = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
             continue
-        (backbone if name.startswith("backbone.") else rest).append(p)
+        (backbone if name.startswith("backbone.") else rest).append(parameter)
     groups = [
         {"params": rest, "lr": base_lr, "weight_decay": wd},
         {"params": backbone, "lr": base_lr * backbone_lr_mult, "weight_decay": wd},
     ]
     if criterion is not None:
-        criterion_params = [p for p in criterion.parameters() if p.requires_grad]
+        criterion_params = [parameter for parameter in criterion.parameters()
+                            if parameter.requires_grad]
         if criterion_params:
             groups.append({"params": criterion_params, "lr": base_lr, "weight_decay": wd})
     return [group for group in groups if group["params"]]
 
 
 def build_datasets(cfg, args):
-    tf_train = build_transforms(cfg, train=True)
+    transforms = build_transforms(cfg, train=True)
     datasets, weights = [], []
     if args.bdd_root:
-        datasets.append(BDD100KDataset(args.bdd_root, "train", tf_train, load_seg=True))
-        weights.append(2.0)                          # detection+seg backbone signal
+        datasets.append(BDD100KDataset(args.bdd_root, "train", transforms, load_seg=True))
+        weights.append(2.0)
     if args.gtsrb_root:
-        datasets.append(GTSRBSigns(args.gtsrb_root, "train", tf_train))
+        datasets.append(GTSRBSigns(args.gtsrb_root, "train", transforms))
         weights.append(1.0)
     if args.nuscenes_root:
         traj = cfg.model.heads.trajectory
         datasets.append(NuScenesSequences(
             args.nuscenes_root, version=args.nuscenes_version, split=args.nuscenes_split,
             future_len=traj.future_len, step_dt=traj.step_dt, space=traj.space,
-            transforms=tf_train))
+            transforms=transforms))
         weights.append(1.0)
-    assert datasets, "Provide at least one dataset root (e.g. --bdd-root)."
+    if not datasets:
+        raise ValueError("provide at least one dataset root, for example --bdd-root")
     return ConcatMultiTaskDataset(datasets), weights
 
 
-def train_one_epoch(model, criterion, loader, optim, scaler, device, cfg, epoch,
-                    clip=0.1, log_every=50):
+def _summary_writer(log_dir, rank):
+    if rank != 0:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        return SummaryWriter(log_dir)
+    except ImportError:
+        print("[train] tensorboard is unavailable; scalar event logging disabled")
+        return None
+
+
+def _distributed_context():
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    if world_size > 1:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    return rank, world_size, local_rank, device
+
+
+def _checkpoint_state(model, criterion, optimizer, scheduler, scaler, ema,
+                      cfg, epoch, global_step, best_map):
+    model_state = {
+        name: value for name, value in unwrap_module(model).state_dict().items()
+        if not name.startswith("backbone.teacher.")
+    }
+    ema_state = {
+        name: value for name, value in ema.state_dict().items()
+        if not name.startswith("backbone.teacher.")
+    }
+    return {
+        "model": model_state,
+        "ema": ema_state,
+        "criterion": unwrap_module(criterion).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "cfg": config_to_dict(cfg),
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_detection_map": best_map,
+    }
+
+
+def _load_resume(path, model, criterion, optimizer, scheduler, scaler, ema):
+    checkpoint = torch.load(path, map_location="cpu")
+    model.load_state_dict(checkpoint["model"], strict=False)
+    if "ema" in checkpoint:
+        ema.load_state_dict(checkpoint["ema"])
+    if "criterion" in checkpoint:
+        criterion.load_state_dict(checkpoint["criterion"])
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if "scheduler" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    if "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
+    return (checkpoint.get("epoch", -1) + 1, checkpoint.get("global_step", 0),
+            checkpoint.get("best_detection_map", float("-inf")))
+
+
+def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, epoch,
+                    scheduler=None, ema: Optional[ModelEMA] = None, writer=None,
+                    global_step=0, clip=0.1, log_every=50, rank=0):
     model.train()
     criterion.train()
+    raw_model = unwrap_module(model)
     distill_on = cfg.model.backbone.gram_anchor_distill
-    for it, batch in enumerate(loader):
+    for iteration, batch in enumerate(loader):
         images = batch["images"].to(device, non_blocking=True)
-        targets = _targets_to_device(batch["targets"], device)
+        targets = targets_to_device(batch["targets"], device)
         sign_rois = batch["extras"]["sign_rois"].to(device)
 
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            out = model(images, sign_rois=sign_rois if sign_rois.numel() else None)
-            teacher_feat = model.backbone.teacher_features(images) if distill_on else None
-            student_feat = out["_srcs"][1] if distill_on else None      # stride-16 level
-            losses = criterion(out, targets, student_feat, teacher_feat)
+            outputs = model(images, sign_rois=sign_rois if sign_rois.numel() else None)
+            teacher_feat = raw_model.backbone.teacher_features(images) if distill_on else None
+            student_feat = outputs["_srcs"][1] if distill_on else None
+            losses = criterion(outputs, targets, student_feat, teacher_feat)
             loss = losses["total"]
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
-        scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(
-            [*model.parameters(), *criterion.parameters()], clip)
-        scaler.step(optim)
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_([*model.parameters(), *criterion.parameters()], clip)
+        scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
+        if ema is not None:
+            ema.update(model)
+        global_step += 1
 
-        if it % log_every == 0:
-            parts = {k: float(v) for k, v in losses.items()
-                     if torch.is_tensor(v) and v.ndim == 0 and k != "total"}
-            print(f"[ep{epoch} it{it}/{len(loader)}] total={float(loss):.3f} "
-                  f"({batch['extras']['dataset']}) "
-                  + " ".join(f"{k}={v:.3f}" for k, v in parts.items()
-                             if k in ('detection', 'segmentation', 'sign', 'distill')))
-
-
-def _targets_to_device(targets, device):
-    out = {}
-    for k, v in targets.items():
-        if v is None:
-            out[k] = None
-        elif k == "detection":
-            out[k] = [{kk: vv.to(device) if torch.is_tensor(vv) else vv
-                       for kk, vv in t.items()} for t in v]
-        elif torch.is_tensor(v):
-            out[k] = v.to(device)
-        elif isinstance(v, list) and all(torch.is_tensor(item) for item in v):
-            out[k] = [item.to(device) for item in v]
-        else:
-            out[k] = v
-    return out
+        scalars = {key: float(value.detach()) for key, value in losses.items()
+                   if torch.is_tensor(value) and value.ndim == 0}
+        if writer is not None:
+            for key, value in scalars.items():
+                writer.add_scalar(f"train/{key}", value, global_step)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+        if rank == 0 and iteration % log_every == 0:
+            active = " ".join(
+                f"{key}={value:.3f}" for key, value in scalars.items()
+                if key in ("detection", "segmentation", "sign", "distill"))
+            print(f"[ep{epoch} it{iteration}/{len(loader)}] total={scalars['total']:.3f} "
+                  f"lr={optimizer.param_groups[0]['lr']:.2e} "
+                  f"({batch['extras']['dataset']}) {active}")
+    return global_step
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--bdd-root", default=None)
-    ap.add_argument("--gtsrb-root", default=None)
-    ap.add_argument("--nuscenes-root", default=None)
-    ap.add_argument("--nuscenes-version", default="v1.0-trainval")
-    ap.add_argument("--nuscenes-split", default="train")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--out", default="checkpoints")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--bdd-root", default=None)
+    parser.add_argument("--gtsrb-root", default=None)
+    parser.add_argument("--nuscenes-root", default=None)
+    parser.add_argument("--nuscenes-version", default="v1.0-trainval")
+    parser.add_argument("--nuscenes-split", default="train")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--ema-decay", type=float, default=0.9998)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=1)
+    parser.add_argument("--max-eval-batches", type=int, default=None)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--out", default="checkpoints")
+    args = parser.parse_args()
 
+    rank, world_size, local_rank, device = _distributed_context()
+    seed_everything(args.seed + rank)
     cfg = load_config(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_cwdetr(cfg).to(device)
     teacher_dim = (model.backbone.teacher_out_channels
@@ -137,28 +207,77 @@ def main():
     criterion = MultiTaskCriterion(cfg.model.heads.detection.num_classes,
                                    teacher_dim=teacher_dim,
                                    student_dim=cfg.model.hidden_dim).to(device)
-
     dataset, weights = build_datasets(cfg, args)
-    sampler = MixedBatchSampler(dataset, args.batch_size, weights)
+    sampler = MixedBatchSampler(dataset, args.batch_size, weights, seed=args.seed,
+                                rank=rank, world_size=world_size)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=args.workers,
-                        collate_fn=collate_fn, pin_memory=True)
+                        collate_fn=collate_fn, pin_memory=device.type == "cuda",
+                        worker_init_fn=make_worker_init_fn(args.seed, rank))
 
-    optim = torch.optim.AdamW(build_param_groups(model, args.lr, criterion))
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    optimizer = torch.optim.AdamW(build_param_groups(model, args.lr, criterion))
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer, args.warmup_steps, args.epochs * max(1, len(loader)))
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    ema = ModelEMA(model, args.ema_decay)
+    start_epoch, global_step, best_map = 0, 0, float("-inf")
+    if args.resume:
+        start_epoch, global_step, best_map = _load_resume(
+            args.resume, model, criterion, optimizer, scheduler, scaler, ema)
+
+    if world_size > 1:
+        ddp_kwargs = {"find_unused_parameters": True}
+        if device.type == "cuda":
+            ddp_kwargs["device_ids"] = [local_rank]
+        model = DDP(model, **ddp_kwargs)
+        criterion = DDP(criterion, **ddp_kwargs)
 
     os.makedirs(args.out, exist_ok=True)
-    for epoch in range(args.epochs):
-        train_one_epoch(model, criterion, loader, optim, scaler, device, cfg, epoch)
-        sched.step()
-        # The frozen distillation teacher is loaded from its configured source
-        # and does not belong in every checkpoint.
-        model_state = {k: v for k, v in model.state_dict().items()
-                       if not k.startswith("backbone.teacher.")}
-        ckpt = {"model": model_state, "criterion": criterion.state_dict(),
-                "cfg": config_to_dict(cfg), "epoch": epoch}
-        torch.save(ckpt, os.path.join(args.out, f"{cfg.name}_ep{epoch:03d}.pth"))
-        print(f"saved checkpoint for epoch {epoch}")
+    writer = _summary_writer(os.path.join(args.out, "tensorboard"), rank)
+    val_loader = None
+    if rank == 0 and (args.bdd_root or args.gtsrb_root):
+        val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root)
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.eval_batch_size, shuffle=False,
+            num_workers=args.workers, collate_fn=collate_fn,
+            pin_memory=device.type == "cuda",
+            worker_init_fn=make_worker_init_fn(args.seed))
+
+    for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
+        global_step = train_one_epoch(
+            model, criterion, loader, optimizer, scaler, device, cfg, epoch,
+            scheduler=scheduler, ema=ema, writer=writer, global_step=global_step,
+            rank=rank)
+
+        metrics = None
+        if rank == 0 and val_loader is not None and (epoch + 1) % args.eval_every == 0:
+            metrics = evaluate_loader(
+                ema.module, val_loader, device, cfg.model.heads.detection.num_classes,
+                args.max_eval_batches)
+            print_metrics(metrics)
+            if writer is not None:
+                for key, value in metrics.items():
+                    writer.add_scalar(f"eval/{key}", value, global_step)
+
+        if rank == 0:
+            is_best = False
+            if metrics is not None:
+                is_best = metrics["detection/map"] > best_map
+                best_map = max(best_map, metrics["detection/map"])
+            state = _checkpoint_state(model, criterion, optimizer, scheduler, scaler,
+                                      ema, cfg, epoch, global_step, best_map)
+            epoch_path = os.path.join(args.out, f"{cfg.name}_ep{epoch:03d}.pth")
+            torch.save(state, epoch_path)
+            if is_best:
+                torch.save(state, os.path.join(args.out, "best_detection_map.pth"))
+            print(f"saved checkpoint for epoch {epoch}")
+        if world_size > 1:
+            dist.barrier()
+
+    if writer is not None:
+        writer.close()
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

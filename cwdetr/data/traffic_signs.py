@@ -9,6 +9,7 @@ fine labels; use ``MapillaryTrafficSign`` for in-context ROIs. Both yield the
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 from typing import Dict
@@ -25,13 +26,39 @@ class GTSRBSigns(Dataset):
         self.transforms = transforms
         self.samples = []
         base = os.path.join(root, "Train" if split == "train" else "Test")
-        for cls in sorted(os.listdir(base)):
-            cdir = os.path.join(base, cls)
-            if not os.path.isdir(cdir):
-                continue
-            for fn in os.listdir(cdir):
-                if fn.lower().endswith((".png", ".ppm", ".jpg")):
-                    self.samples.append((os.path.join(cdir, fn), int(cls)))
+        if os.path.isdir(base):
+            for cls in sorted(os.listdir(base)):
+                cdir = os.path.join(base, cls)
+                if not os.path.isdir(cdir) or not cls.isdigit():
+                    continue
+                for fn in os.listdir(cdir):
+                    if fn.lower().endswith((".png", ".ppm", ".jpg")):
+                        self.samples.append((os.path.join(cdir, fn), int(cls)))
+        if not self.samples and split != "train":
+            self._load_flat_test_csv(root, base)
+        if not self.samples:
+            raise FileNotFoundError(f"no GTSRB {split} samples found under {root}")
+
+    def _load_flat_test_csv(self, root: str, base: str):
+        csv_paths = [os.path.join(root, name) for name in ("Test.csv", "GT-final_test.csv")]
+        csv_paths += [os.path.join(base, name) for name in ("Test.csv", "GT-final_test.csv")]
+        csv_path = next((path for path in csv_paths if os.path.isfile(path)), None)
+        if csv_path is None:
+            return
+        with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+            first_line = handle.readline()
+            handle.seek(0)
+            reader = csv.DictReader(handle, delimiter=";" if ";" in first_line else ",")
+            for row in reader:
+                relative = row.get("Path") or row.get("Filename")
+                class_id = row.get("ClassId")
+                if relative is None or class_id is None:
+                    continue
+                candidates = [os.path.join(root, relative), os.path.join(base, relative),
+                              os.path.join(base, os.path.basename(relative))]
+                image_path = next((path for path in candidates if os.path.isfile(path)), None)
+                if image_path is not None:
+                    self.samples.append((image_path, int(class_id)))
 
     def __len__(self):
         return len(self.samples)

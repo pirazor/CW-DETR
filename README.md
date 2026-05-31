@@ -103,6 +103,11 @@ python -m cwdetr.engine.train --config configs/cwdetr_nano_orin.yaml \
     --bdd-root /data/bdd100k --nuscenes-root /data/nuscenes \
     --gtsrb-root /data/GTSRB --epochs 50
 
+# validate a checkpoint (COCO mAP, drivable/lane metrics, teacher-forced sign top-1)
+python -m cwdetr.engine.evaluate --config configs/cwdetr_nano_orin.yaml \
+    --ckpt checkpoints/best_detection_map.pth --bdd-root /data/bdd100k \
+    --gtsrb-root /data/GTSRB
+
 # export + build a Jetson engine (run the TensorRT build on-device)
 python -m cwdetr.export.export_onnx    --config configs/cwdetr_nano_orin.yaml --out cwdetr.onnx
 python -m cwdetr.export.build_tensorrt --onnx cwdetr.onnx --precision int8 \
