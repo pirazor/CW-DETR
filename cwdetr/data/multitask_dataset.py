@@ -9,15 +9,26 @@ uncertainty weighter keeps the active tasks balanced across steps.
 from __future__ import annotations
 
 import random
-from typing import Dict, List
+from typing import Dict, List, Mapping, Optional
 
 import torch
 from torch.utils.data import Dataset, Sampler
 
 
 class ConcatMultiTaskDataset(Dataset):
-    def __init__(self, datasets: List[Dataset]):
+    def __init__(self, datasets: List[Dataset],
+                 sign_label_maps: Optional[Mapping[str, Mapping[int, int]]] = None):
         self.datasets = datasets
+        self.sign_label_maps = dict(sign_label_maps or {})
+        sign_taxonomies = {
+            dataset.sign_taxonomy for dataset in datasets
+            if getattr(dataset, "sign_taxonomy", None) is not None
+        }
+        missing_maps = sign_taxonomies - set(self.sign_label_maps)
+        if len(sign_taxonomies) > 1 and missing_maps:
+            raise ValueError(
+                "incompatible sign taxonomies require explicit sign_label_maps; "
+                f"missing mappings for {sorted(missing_maps)}")
         self.lengths = [len(d) for d in datasets]
         self.offsets, c = [], 0
         for n in self.lengths:
@@ -36,7 +47,16 @@ class ConcatMultiTaskDataset(Dataset):
 
     def __getitem__(self, gidx):
         di, li = self.locate(gidx)
-        return self.datasets[di][li]
+        dataset = self.datasets[di]
+        sample = dataset[li]
+        taxonomy = getattr(dataset, "sign_taxonomy", None)
+        if taxonomy in self.sign_label_maps and sample.get("sign_labels") is not None:
+            mapping = self.sign_label_maps[taxonomy]
+            sample = dict(sample)
+            sample["sign_labels"] = torch.as_tensor(
+                [mapping.get(int(label), -1) for label in sample["sign_labels"]],
+                dtype=torch.long)
+        return sample
 
 
 class MixedBatchSampler(Sampler):
@@ -77,7 +97,8 @@ class MixedBatchSampler(Sampler):
 
 def collate_fn(batch: List[Dict]) -> Dict:
     images = torch.stack([s["image"] for s in batch])
-    detection = [{"labels": s["labels"], "boxes": s["boxes"]} for s in batch]
+    detection = [{"labels": s["labels"], "boxes": s["boxes"],
+                  "train_detection": s.get("train_detection", True)} for s in batch]
 
     has_drivable = all(s.get("drivable") is not None for s in batch)
     has_lane = all(s.get("lane") is not None for s in batch)
@@ -111,5 +132,10 @@ def collate_fn(batch: List[Dict]) -> Dict:
     if all("track_ids" in s for s in batch):
         targets["track_ids"] = [s["track_ids"] for s in batch]
 
-    extras = {"sign_rois": sign_rois, "dataset": batch[0].get("dataset", "?")}
+    extras = {
+        "sign_rois": sign_rois,
+        "dataset": batch[0].get("dataset", "?"),
+        "image_ids": [s.get("image_id") for s in batch],
+        "orig_sizes": [s.get("orig_size") for s in batch],
+    }
     return {"images": images, "targets": targets, "extras": extras}

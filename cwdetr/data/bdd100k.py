@@ -71,10 +71,13 @@ class BDD100KDataset(Dataset):
             "image": img,
             "labels": torch.as_tensor(labels, dtype=torch.long),
             "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "train_detection": True,
             "drivable": self._load_mask("drivable", name) if self.load_seg else None,
             "lane": self._load_mask("lane", name) if self.load_seg else None,
             "sign_boxes": torch.as_tensor(sign_boxes, dtype=torch.float32).reshape(-1, 4),
             "sign_labels": torch.full((len(sign_boxes),), -1, dtype=torch.long),  # unlabeled sub-class
+            "image_id": name,
+            "orig_size": (h, w),
             "dataset": "bdd100k",
         }
         if self.transforms:

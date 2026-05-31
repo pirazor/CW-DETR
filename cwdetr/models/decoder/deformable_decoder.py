@@ -179,7 +179,7 @@ class DeformableDecoder(nn.Module):
 class DeformableTransformer(nn.Module):
     """Glue: flatten projector memory, build queries (two-stage), run decoder."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, num_classes: Optional[int] = None):
         super().__init__()
         d = cfg.hidden_dim
         self.d_model = d
@@ -197,10 +197,16 @@ class DeformableTransformer(nn.Module):
             num_layers=cfg.num_layers, look_forward_twice=cfg.look_forward_twice)
 
         if self.two_stage:
+            if num_classes is None:
+                raise ValueError("two-stage decoder requires num_classes for encoder proposals")
             self.enc_output = nn.Linear(d, d)
             self.enc_output_norm = nn.LayerNorm(d)
-            self.enc_objectness = nn.Linear(d, 1)
+            self.enc_class_embed = nn.Linear(d, num_classes)
             self.enc_bbox = MLP(d, d, 4, 3)
+            prior_prob = 0.01
+            nn.init.constant_(self.enc_class_embed.bias, -math.log((1 - prior_prob) / prior_prob))
+            nn.init.constant_(self.enc_bbox.layers[-1].weight, 0.0)
+            nn.init.constant_(self.enc_bbox.layers[-1].bias, 0.0)
             # proposal pos-embed is 4 coords * (d/2) feats = 2d wide -> project to d
             self.pos_trans = nn.Linear(d * 2, d)
             self.pos_trans_norm = nn.LayerNorm(d)
@@ -235,19 +241,22 @@ class DeformableTransformer(nn.Module):
             output_memory, output_proposals = gen_encoder_output_proposals(
                 src_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
-            obj = self.enc_objectness(output_memory)                       # [B, L, 1]
+            enc_logits = self.enc_class_embed(output_memory)              # [B, L, C]
             coord = self.enc_bbox(output_memory) + output_proposals        # [B, L, 4]
             valid = torch.isfinite(output_proposals).all(-1, keepdim=True)
-            obj = obj.masked_fill(~valid, float("-inf"))
-            topk = min(self.num_queries, obj.shape[1])
-            topk_idx = torch.topk(obj[..., 0], topk, dim=1)[1]
-            ref = torch.gather(coord, 1, topk_idx[..., None].expand(-1, -1, 4)).sigmoid()
-            ref = ref.detach()
+            score = enc_logits.max(-1).values.masked_fill(~valid[..., 0], float("-inf"))
+            topk = min(self.num_queries, enc_logits.shape[1])
+            topk_idx = torch.topk(score, topk, dim=1)[1]
+            enc_logits_sel = torch.gather(
+                enc_logits, 1, topk_idx[..., None].expand(-1, -1, enc_logits.shape[-1]))
+            enc_coord_sel = torch.gather(
+                coord, 1, topk_idx[..., None].expand(-1, -1, 4)).sigmoid()
+            ref = enc_coord_sel.detach()
             query_pos = self.pos_trans_norm(self.pos_trans(
                 get_proposal_pos_embed(ref, self.d_model // 2)))
             tgt = torch.gather(output_memory, 1,
                                topk_idx[..., None].expand(-1, -1, self.d_model)).detach()
-            enc_out = {"objectness": obj, "coords": coord.sigmoid()}
+            enc_out = {"pred_logits": enc_logits_sel, "pred_boxes": enc_coord_sel}
         else:
             qe = self.query_embed.weight                                   # [Q, 2d]
             query_pos, tgt = torch.split(qe, self.d_model, dim=1)

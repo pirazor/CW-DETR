@@ -47,7 +47,8 @@ class CWDETR(nn.Module):
             in_strides=self.backbone.out_strides,
             hidden_dim=hd, num_levels=m.decoder.num_feature_levels)
         self.finest_stride = self.backbone.out_strides[0]
-        self.transformer = DeformableTransformer(m.decoder)
+        self.transformer = DeformableTransformer(
+            m.decoder, num_classes=m.heads.detection.num_classes)
 
         # ---- heads --------------------------------------------------------- #
         self.detection_head = DetectionHead(hd, m.heads.detection.num_classes,

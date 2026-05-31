@@ -33,7 +33,9 @@ detection transformers — and makes two structural upgrades:
 
 > **Status:** repaired, runnable baseline scaffold — **not yet trained**. The offline suite
 > shape-verifies the shared trunk, heads, losses, config loader, and tracker state machinery.
-> End-to-end temporal clip training and on-device TensorRT profiling remain roadmap work. All
+> End-to-end temporal clip training, RoPE-correct ViT windowing, and on-device TensorRT profiling
+> remain roadmap work. Learned tracking and trajectory heads are disabled in the baseline configs
+> until their temporal supervision lands. All
 > accuracy / latency figures in the docs are engineering targets derived from component baselines,
 > not measured CW-DETR results.
 
@@ -62,6 +64,9 @@ detection transformers — and makes two structural upgrades:
 
 Full rationale, training plan, Jetson optimization, and roadmap:
 **[`docs/CW-DETR_Architecture_and_Strategy.md`](docs/CW-DETR_Architecture_and_Strategy.md)**.
+
+Pre-training correctness and readiness gates:
+**[`docs/CW-DETR_Training_Readiness_Plan.md`](docs/CW-DETR_Training_Readiness_Plan.md)**.
 
 Measured improvement plan and acceptance gates:
 **[`docs/CW-DETR_Jetson_Improvement_Plan.md`](docs/CW-DETR_Jetson_Improvement_Plan.md)**.

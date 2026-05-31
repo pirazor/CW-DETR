@@ -27,11 +27,11 @@ model:
     embed_dim: 768                   # ViT-B/16 hidden size
     depth: 12
     num_register_tokens: 4
-    # Tap 3 intermediate blocks; projector builds a {1/8, 1/16, 1/32} pyramid.
-    out_layer_indices: [5, 8, 11]    # 0-indexed transformer blocks
+    # Project the final stride-16 ViT map into a {1/8, 1/16, 1/32} pyramid.
+    out_layer_indices: [11]          # retained for Meta-backend compatibility
     simple_fpn: true                 # ViTDet simple feature pyramid (deconv/conv resampling)
-    windowed_attention: true         # RF-DETR-style windowed/global alternation
-    window_block_indices: [0,1,3,4,6,7,9,10]   # remaining blocks use global attention
+    windowed_attention: false        # re-enable only after local-window RoPE is implemented
+    window_block_indices: []
     window_size: 8                   # in patch units
     freeze_blocks: 0
     drop_path_rate: 0.2
@@ -59,7 +59,7 @@ model:
       enabled: true
       num_classes: 13
     tracking:
-      enabled: true
+      enabled: false                 # experimental: enable after clip-based supervision lands
       mode: track_query
       max_active_tracks: 300
       score_thresh: 0.5
@@ -75,7 +75,7 @@ model:
       source_det_class: 11
       roi_size: 7
     trajectory:
-      enabled: true
+      enabled: false                 # experimental: enable after ID-aligned temporal training lands
       history_len: 10
       future_len: 12
       step_dt: 0.5

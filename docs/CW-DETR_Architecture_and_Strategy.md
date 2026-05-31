@@ -147,9 +147,9 @@ Meta-repository load for experiments, but it gives up the pretrained representat
 tier the wrapper returns the native {8,16,32}-stride pyramid. For the ViT tier it takes the
 stride-16 patch grid (dropping the CLS + 4 register tokens, per the confirmed
 `[CLS|registers|patches]` token layout) and lifts it to a three-level pyramid with a ViTDet
-"simple feature pyramid." Optional windowed attention (`windowed_attention.py`) restricts most
-Hugging Face ViT blocks to local windows, RF-DETR style, to keep cost linear in token count; the
-official Meta ViT backend currently stays on its native global-attention path.
+"simple feature pyramid." ViT windowed attention is intentionally disabled in baseline configs:
+the current scaffold is not RoPE-correct. Reintroduce local windows only as a measured follow-up
+with per-window rotary positions.
 
 **Projector (`models/projector.py`).** A light PAN-style neck with C2f fusion blocks unifies the
 backbone maps to a common width (256 for N, 384 for B) and emits exactly the number of feature
@@ -158,7 +158,7 @@ levels the decoder samples (3). This is the RF-DETR/LW-DETR projector role, made
 **Decoder (`models/decoder/`).** A Deformable-DETR decoder cross-attends directly into the
 flattened projector memory — the backbone+projector *are* the encoder, so there is no separate
 deformable encoder (this is the RF-DETR single-scale choice, which is faster). It uses two-stage
-query initialization (objectness-ranked proposals from the memory), iterative box refinement with
+query initialization (class-ranked proposals from the memory), iterative box refinement with
 DINO `look_forward_twice`, and a `self_attn_mask` hook used by track queries and DN-DETR
 denoising. Crucially the multi-scale deformable attention is the **pure-PyTorch `grid_sample`
 implementation**, which is numerically identical to the CUDA op but exports to ONNX opset-16+ and

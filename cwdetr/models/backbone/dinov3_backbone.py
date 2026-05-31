@@ -81,20 +81,27 @@ class DINOv3Backbone(nn.Module):
         self.kind = cfg.type
         self.patch_size = 16
         self.num_register_tokens = cfg.num_register_tokens
+        self._encoder_channels: Optional[List[int]] = None
+
+        if self.kind == "dinov3_vit" and cfg.windowed_attention:
+            raise ValueError(
+                "DINOv3 ViT windowed_attention is disabled until local-window RoPE "
+                "handling is implemented correctly")
 
         self._load_encoder(cfg)
 
         # Output spec consumed by the projector.
         self.out_strides: List[int] = list(cfg.out_strides)
         if self.kind == "dinov3_vit":
+            self.out_channels = (list(cfg.out_channels) if cfg.out_channels
+                                 else [cfg.embed_dim] * len(self.out_strides))
             self.simple_fpn = SimpleFeaturePyramid(
                 in_dim=cfg.embed_dim,
-                out_dims=list(cfg.out_channels) if cfg.out_channels else [cfg.embed_dim] * 3,
+                out_dims=self.out_channels,
                 strides=self.out_strides,
             )
-            self.out_channels = list(cfg.out_channels)
         else:
-            self.out_channels = list(cfg.out_channels)
+            self.out_channels = list(self._encoder_channels or cfg.out_channels)
 
         self._maybe_freeze(cfg)
 
@@ -118,31 +125,19 @@ class DINOv3Backbone(nn.Module):
         try:
             from transformers import AutoBackbone
             self.encoder = AutoBackbone.from_pretrained(
-                cfg.hf_name, out_indices=cfg.out_indices
+                cfg.hf_name, out_indices=(cfg.out_indices if self.kind == "dinov3_convnext"
+                                          else [-1])
             )
             self._mode = "autobackbone"
-            # Reconcile channel spec with what the model actually reports.
-            if getattr(self.encoder, "channels", None):
-                cfg.out_channels = list(self.encoder.channels)
+            # ConvNeXt emits encoder stages directly. ViT channels describe the
+            # generated simple-FPN outputs and must not be overwritten.
+            if self.kind == "dinov3_convnext" and getattr(self.encoder, "channels", None):
+                self._encoder_channels = list(self.encoder.channels)
         except Exception as exc:  # noqa: BLE001  (we deliberately degrade gracefully)
             print(f"[backbone] AutoBackbone unavailable ({exc}); using AutoModel path.")
             from transformers import AutoModel
             self.encoder = AutoModel.from_pretrained(cfg.hf_name)
             self._mode = "automodel"
-
-        if cfg.windowed_attention and self.kind == "dinov3_vit" and self._mode != "meta_hub":
-            # Patch selected ViT blocks to compute attention within local windows
-            # (RF-DETR / ViTDet scheme). See windowed_attention.convert_to_windowed.
-            try:
-                from cwdetr.models.backbone.windowed_attention import convert_to_windowed
-                convert_to_windowed(
-                    self.encoder,
-                    window_block_indices=cfg.window_block_indices,
-                    window_size=cfg.window_size,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[backbone] windowed-attention patch skipped ({exc}); "
-                      f"using global attention.")
 
     @staticmethod
     def _default_meta_model(kind: str) -> str:
@@ -196,6 +191,23 @@ class DINOv3Backbone(nn.Module):
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad_(False)
+        self.teacher_out_channels = self._feature_width(self.teacher)
+
+    @staticmethod
+    def _feature_width(model: nn.Module) -> int:
+        config = getattr(model, "config", None)
+        for owner in (config, model):
+            for attr in ("hidden_size", "embed_dim", "num_features"):
+                value = getattr(owner, attr, None)
+                if isinstance(value, int):
+                    return value
+        raise ValueError("could not infer DINOv3 teacher feature width")
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.teacher is not None:
+            self.teacher.eval()
+        return self
 
     def _maybe_freeze(self, cfg: BackboneCfg):
         n = cfg.freeze_stages if self.kind == "dinov3_convnext" else cfg.freeze_blocks
@@ -220,6 +232,24 @@ class DINOv3Backbone(nn.Module):
         patches = patches.transpose(1, 2).reshape(b, c, hp, wp)    # [B, C, hp, wp]
         return patches.contiguous()
 
+    def _validate_features(self, x: torch.Tensor,
+                           feats: List[torch.Tensor]) -> List[torch.Tensor]:
+        if len(feats) != len(self.out_channels) or len(feats) != len(self.out_strides):
+            raise ValueError(
+                "DINOv3 backbone feature-count mismatch: "
+                f"got {len(feats)} maps, expected channels={self.out_channels} "
+                f"at strides={self.out_strides}")
+        h, w = x.shape[-2:]
+        for index, (feat, channels, stride) in enumerate(
+                zip(feats, self.out_channels, self.out_strides)):
+            expected_hw = (h // stride, w // stride)
+            if feat.ndim != 4 or feat.shape[1] != channels or feat.shape[-2:] != expected_hw:
+                raise ValueError(
+                    f"DINOv3 backbone map {index} violates contract: got "
+                    f"{tuple(feat.shape)}, expected [B, {channels}, "
+                    f"{expected_hw[0]}, {expected_hw[1]}] at stride {stride}")
+        return feats
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """x: normalized image tensor [B, 3, H, W] -> list of feature maps."""
         h, w = x.shape[-2:]
@@ -227,30 +257,27 @@ class DINOv3Backbone(nn.Module):
 
         if self.kind == "dinov3_convnext":
             if self._mode == "meta_hub":
-                return list(self.encoder.get_intermediate_layers(
+                feats = list(self.encoder.get_intermediate_layers(
                     x, n=self.cfg.out_indices, reshape=True))
+                return self._validate_features(x, feats)
             if self._mode == "autobackbone":
                 feats = list(self.encoder(x).feature_maps)
             else:
                 out = self.encoder(x, output_hidden_states=True)
                 feats = [out.hidden_states[i] for i in self.cfg.out_indices]
-            return feats
+            return self._validate_features(x, feats)
 
         # ----- ViT path: single stride-16 map -> simple feature pyramid ---- #
-        if self.cfg.windowed_attention and self._mode != "meta_hub":
-            from cwdetr.models.backbone.windowed_attention import set_grid_hw
-            set_grid_hw(self.encoder, hp, wp)
         if self._mode == "autobackbone":
             # Use the last requested layer's map (already [B, C, hp, wp]).
             fmap = self.encoder(x).feature_maps[-1]
         elif self._mode == "automodel":
             out = self.encoder(x, output_hidden_states=True)
-            tokens = out.hidden_states[self.cfg.out_layer_indices[-1]]
+            tokens = out.last_hidden_state
             fmap = self._vit_tokens_to_map(tokens, hp, wp)
         else:
-            fmap = self.encoder.get_intermediate_layers(
-                x, n=self.cfg.out_layer_indices, reshape=True)[-1]
-        return self.simple_fpn(fmap)
+            fmap = self.encoder.get_intermediate_layers(x, n=1, reshape=True)[-1]
+        return self._validate_features(x, self.simple_fpn(fmap))
 
     @torch.no_grad()
     def teacher_features(self, x: torch.Tensor) -> Optional[torch.Tensor]:
