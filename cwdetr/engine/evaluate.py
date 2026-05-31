@@ -210,7 +210,8 @@ def evaluate_loader(model, loader, device, num_classes: int,
     return metrics
 
 
-def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None):
+def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None,
+                       refresh_yolo_index=False):
     transforms = build_transforms(cfg, train=False)
     datasets = []
     if bdd_root:
@@ -220,7 +221,8 @@ def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None):
     if yolo_data:
         datasets.append(YoloDetectionDataset(
             yolo_data, "val", transforms,
-            expected_num_classes=cfg.model.heads.detection.num_classes))
+            expected_num_classes=cfg.model.heads.detection.num_classes,
+            refresh_index=refresh_yolo_index))
     if not datasets:
         raise ValueError("provide at least one validation root")
     return ConcatMultiTaskDataset(datasets)
@@ -240,6 +242,8 @@ def main():
     parser.add_argument("--bdd-root", default=None)
     parser.add_argument("--yolo-data", default=None,
                         help="YOLO data.yaml for detection-only evaluation")
+    parser.add_argument("--refresh-yolo-index", action="store_true",
+                        help="rescan YOLO image folders and replace cached manifests")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
@@ -253,7 +257,8 @@ def main():
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         model.load_state_dict(checkpoint.get("ema", checkpoint.get("model", checkpoint)),
                               strict=False)
-    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data)
+    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data,
+                                 args.refresh_yolo_index)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, collate_fn=collate_fn,
                         pin_memory=device.type == "cuda")

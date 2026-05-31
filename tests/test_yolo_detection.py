@@ -71,6 +71,21 @@ def test_yolo_detection_dataset_rejects_model_class_mismatch(tmp_path):
         YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=8)
 
 
+def test_yolo_detection_dataset_caches_and_refreshes_image_manifest(tmp_path):
+    yaml_path = _write_yaml(tmp_path)
+    _write_image(tmp_path, "train", "first.jpg")
+    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
+    assert dataset.index_path.exists()
+    assert len(dataset) == 1
+
+    _write_image(tmp_path, "train", "second.jpg")
+    cached = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
+    refreshed = YoloDetectionDataset(
+        str(yaml_path), "train", expected_num_classes=9, refresh_index=True)
+    assert len(cached) == 1
+    assert len(refreshed) == 2
+
+
 def test_yolo_detection_dataset_rejects_non_detection_rows(tmp_path):
     yaml_path = _write_yaml(tmp_path)
     _write_image(tmp_path, "train", "sample.jpg")

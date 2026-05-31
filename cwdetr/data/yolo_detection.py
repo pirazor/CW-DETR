@@ -11,7 +11,9 @@ follow the usual YOLO sibling layout::
       data.yaml
 
 Each label row must be ``class_id cx cy width height`` with normalized box
-coordinates. Missing label files represent valid background images.
+coordinates. Missing label files represent valid background images. A small
+manifest is cached beside ``data.yaml`` so remote filesystems such as a mounted
+Google Drive only need one recursive image scan.
 """
 from __future__ import annotations
 
@@ -52,7 +54,8 @@ class YoloDetectionDataset(Dataset):
     """Read YOLO detection labels into CW-DETR's normalized target contract."""
 
     def __init__(self, data_yaml: str, split: str, transforms=None,
-                 expected_num_classes: Optional[int] = None):
+                 expected_num_classes: Optional[int] = None,
+                 refresh_index: bool = False):
         self.data_yaml = Path(data_yaml).expanduser().resolve()
         self.split = split
         self.transforms = transforms
@@ -88,11 +91,32 @@ class YoloDetectionDataset(Dataset):
                 f"YOLO split path must contain an 'images' directory: {self.image_dir}")
         parts[image_indices[-1]] = "labels"
         self.label_dir = Path(*parts)
+        self.index_path = self.data_yaml.parent / f".cwdetr-{self.data_yaml.stem}-{split}-images.txt"
+        self.images = self._load_images(refresh_index)
+        if not self.images:
+            raise ValueError(f"YOLO split contains no supported images: {self.image_dir}")
+
+    def _load_images(self, refresh_index: bool) -> List[Path]:
+        if self.index_path.exists() and not refresh_index:
+            images = []
+            for relative in self.index_path.read_text(encoding="utf-8").splitlines():
+                if not relative:
+                    continue
+                relative_path = Path(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise ValueError(f"invalid path in YOLO image manifest: {relative!r}")
+                images.append(self.image_dir / relative_path)
+            if images:
+                return images
+
         self.images = sorted(
             path for path in self.image_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
-        if not self.images:
-            raise ValueError(f"YOLO split contains no supported images: {self.image_dir}")
+        if self.images:
+            contents = "\n".join(
+                path.relative_to(self.image_dir).as_posix() for path in self.images) + "\n"
+            self.index_path.write_text(contents, encoding="utf-8")
+        return self.images
 
     def __len__(self) -> int:
         return len(self.images)

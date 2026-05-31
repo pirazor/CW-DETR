@@ -49,7 +49,8 @@ def build_datasets(cfg, args):
     if args.yolo_data:
         datasets.append(YoloDetectionDataset(
             args.yolo_data, "train", transforms,
-            expected_num_classes=cfg.model.heads.detection.num_classes))
+            expected_num_classes=cfg.model.heads.detection.num_classes,
+            refresh_index=getattr(args, "refresh_yolo_index", False)))
         weights.append(2.0)
     if args.gtsrb_root:
         datasets.append(GTSRBSigns(args.gtsrb_root, "train", transforms))
@@ -187,6 +188,8 @@ def main():
     parser.add_argument("--bdd-root", default=None)
     parser.add_argument("--yolo-data", default=None,
                         help="YOLO data.yaml for detection-only training")
+    parser.add_argument("--refresh-yolo-index", action="store_true",
+                        help="rescan YOLO image folders and replace cached manifests")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--nuscenes-root", default=None)
     parser.add_argument("--nuscenes-version", default="v1.0-trainval")
@@ -245,7 +248,7 @@ def main():
     val_loader = None
     if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
         val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root,
-                                         args.yolo_data)
+                                         args.yolo_data, args.refresh_yolo_index)
         val_loader = DataLoader(
             val_dataset, batch_size=args.eval_batch_size, shuffle=False,
             num_workers=args.workers, collate_fn=collate_fn,
