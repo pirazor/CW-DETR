@@ -24,9 +24,10 @@ from cwdetr.models.cwdetr import build_cwdetr
 class CWDETRInfer(nn.Module):
     """Thin inference wrapper returning export-friendly tensors."""
 
-    def __init__(self, model):
+    def __init__(self, model, include_sign_features: bool = False):
         super().__init__()
         self.model = model
+        self.include_sign_features = include_sign_features
 
     def forward(self, image):
         out = self.model(image, run_seg=True)
@@ -34,23 +35,28 @@ class CWDETRInfer(nn.Module):
         results = (det["pred_logits"].sigmoid(), det["pred_boxes"])
         if "segmentation" in out:
             results = results + (out["segmentation"]["drivable_logits"].argmax(1).to(torch.int32),
-                                 out["segmentation"]["lane_logits"].argmax(1).to(torch.int32))
+                                  out["segmentation"]["lane_logits"].argmax(1).to(torch.int32))
+        if self.include_sign_features:
+            results = results + (out["_srcs"][0],)
         return results
 
 
-def export(config: str, ckpt: str, out_path: str, opset: int = 18):
+def export(config: str, ckpt: str, out_path: str, opset: int = 18,
+           include_sign_features: bool = False):
     cfg = load_config(config)
     model = build_cwdetr(cfg).eval()
     if ckpt:
         sd = torch.load(ckpt, map_location="cpu")
         model.load_state_dict(sd.get("model", sd), strict=False)
 
-    wrapper = CWDETRInfer(model).eval()
+    wrapper = CWDETRInfer(model, include_sign_features=include_sign_features).eval()
     dummy = torch.randn(1, 3, cfg.input.height, cfg.input.width)
 
     names_out = ["scores", "boxes"]
     if cfg.model.heads.segmentation.enabled:
         names_out.extend(["drivable", "lane"])
+    if include_sign_features:
+        names_out.append("sign_features")
     torch.onnx.export(
         wrapper, dummy, out_path,
         input_names=["image"], output_names=names_out,
@@ -72,5 +78,7 @@ if __name__ == "__main__":
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--out", default="cwdetr.onnx")
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--sign-features", action="store_true",
+                    help="also export the finest projector map for the optional sign sidecar")
     a = ap.parse_args()
-    export(a.config, a.ckpt, a.out, a.opset)
+    export(a.config, a.ckpt, a.out, a.opset, a.sign_features)

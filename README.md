@@ -108,11 +108,19 @@ python -m cwdetr.engine.evaluate --config configs/cwdetr_nano_orin.yaml \
     --ckpt checkpoints/best_detection_map.pth --bdd-root /data/bdd100k \
     --gtsrb-root /data/GTSRB
 
-# export + build a Jetson engine (run the TensorRT build on-device)
-python -m cwdetr.export.export_onnx    --config configs/cwdetr_nano_orin.yaml --out cwdetr.onnx
+# export + build Jetson engines (run TensorRT builds and profiling on-device)
+python -m cwdetr.export.export_onnx    --config configs/cwdetr_nano_orin.yaml \
+    --ckpt checkpoints/best_detection_map.pth --sign-features --out cwdetr.onnx
+python -m cwdetr.export.export_sign_sidecar --config configs/cwdetr_nano_orin.yaml \
+    --ckpt checkpoints/best_detection_map.pth --out cwdetr_sign.onnx
 python -m cwdetr.export.build_tensorrt --onnx cwdetr.onnx --precision int8 \
     --calib-dir /data/calib --out cwdetr_nano_int8.plan
-python -m cwdetr.export.jetson_infer   --engine cwdetr_nano_int8.plan --track
+python -m cwdetr.export.build_tensorrt --onnx cwdetr_sign.onnx --precision fp16 \
+    --out cwdetr_sign_fp16.plan
+python -m cwdetr.export.jetson_infer   --engine cwdetr_nano_int8.plan \
+    --sign-engine cwdetr_sign_fp16.plan --track
+python -m cwdetr.export.profile_jetson --core-engine cwdetr_nano_int8.plan \
+    --sign-engine cwdetr_sign_fp16.plan --precision int8 --out profiles/nano_int8.json
 ```
 
 ## Repository layout
