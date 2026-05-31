@@ -243,7 +243,7 @@ def main():
     parser.add_argument("--yolo-data", default=None,
                         help="YOLO data.yaml for detection-only evaluation")
     parser.add_argument("--refresh-yolo-index", action="store_true",
-                        help="rescan YOLO image folders and replace cached manifests")
+                        help="rescan YOLO images and rebuild parsed-label caches")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)

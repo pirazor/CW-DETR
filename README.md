@@ -141,11 +141,11 @@ python -m cwdetr.engine.evaluate \
     --ckpt checkpoints/best_detection_map.pth
 ```
 
-The first run caches per-split image manifests beside `data.yaml`, avoiding
-repeated recursive scans on mounted Google Drive. Pass `--refresh-yolo-index`
-after adding or removing images. The adapter retries transient mounted-drive
-read failures. For Colab training directly from Drive, start with `--workers 0`
-to avoid concurrent reads overwhelming the mount.
+The first run caches per-split image manifests and parsed labels beside
+`data.yaml`, avoiding repeated recursive scans and per-sample label-file reads
+on mounted Google Drive. Existing Ultralytics `labels.cache` files are imported
+when available. Pass `--refresh-yolo-index` after adding, removing, or editing
+images or labels. The adapter retries transient mounted-drive read failures.
 
 Colab workflow:
 **[`notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb`](notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb)**.

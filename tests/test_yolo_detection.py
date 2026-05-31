@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import numpy as np
 import torch
 from PIL import Image
 
@@ -93,9 +94,8 @@ def test_yolo_detection_dataset_rejects_non_detection_rows(tmp_path):
     label = tmp_path / "train" / "labels" / "sample.txt"
     label.parent.mkdir(parents=True)
     label.write_text("0 0.5 0.5 0.2 0.2 0.7 0.7\n", encoding="utf-8")
-    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
     with pytest.raises(ValueError, match="expected YOLO detection row"):
-        dataset[0]
+        YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
 
 
 def test_yolo_detection_dataset_retries_transient_label_reads(tmp_path):
@@ -104,7 +104,6 @@ def test_yolo_detection_dataset_retries_transient_label_reads(tmp_path):
     label = tmp_path / "train" / "labels" / "sample.txt"
     label.parent.mkdir(parents=True)
     label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
-    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
     original_read_text = Path.read_text
     failures = 0
 
@@ -117,9 +116,50 @@ def test_yolo_detection_dataset_retries_transient_label_reads(tmp_path):
 
     with mock.patch.object(Path, "read_text", flaky_read_text), \
             mock.patch("cwdetr.data.yolo_detection.time.sleep"):
-        sample = dataset[0]
+        dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
     assert failures == 2
-    assert sample["labels"].tolist() == [0]
+    assert dataset[0]["labels"].tolist() == [0]
+
+
+def test_yolo_detection_dataset_uses_parsed_labels_during_getitem(tmp_path):
+    yaml_path = _write_yaml(tmp_path)
+    _write_image(tmp_path, "train", "sample.jpg")
+    label = tmp_path / "train" / "labels" / "sample.txt"
+    label.parent.mkdir(parents=True)
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
+    original_read_text = Path.read_text
+
+    def reject_label_read(path, *args, **kwargs):
+        if path == label:
+            raise AssertionError("getitem must not reopen cached YOLO label files")
+        return original_read_text(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", reject_label_read):
+        assert dataset[0]["labels"].tolist() == [0]
+
+
+def test_yolo_detection_dataset_imports_existing_ultralytics_label_cache(tmp_path):
+    yaml_path = _write_yaml(tmp_path)
+    image = _write_image(tmp_path, "train", "sample.jpg")
+    label_dir = tmp_path / "train" / "labels"
+    label_dir.mkdir(parents=True)
+    ultralytics_cache = label_dir.with_suffix(".cache")
+    payload = {
+        "labels": [{
+            "im_file": str(image),
+            "cls": np.asarray([[8.0]], dtype=np.float32),
+            "bboxes": np.asarray([[0.5, 0.4, 0.2, 0.3]], dtype=np.float32),
+        }],
+    }
+    with ultralytics_cache.open("wb") as handle:
+        np.save(handle, payload)
+
+    dataset = YoloDetectionDataset(str(yaml_path), "train", expected_num_classes=9)
+    sample = dataset[0]
+    assert sample["labels"].tolist() == [8]
+    assert torch.allclose(sample["boxes"], torch.tensor([[0.5, 0.4, 0.2, 0.3]]))
+    assert dataset.label_cache_path.exists()
 
 
 def test_yolo_detection_only_config_and_eval_builder(tmp_path):
