@@ -48,13 +48,16 @@ class TRTModel:
             self.ctx.set_tensor_address(name, int(dev_mem))
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 self.inputs.append(name)
-        if len(self.inputs) != 1:
-            raise ValueError(f"expected exactly one TensorRT input, found {self.inputs}")
-
-    def infer(self, image_chw: np.ndarray):
-        inp = self.inputs[0]
-        np.copyto(self.host[inp], image_chw.ravel())
-        cuda.memcpy_htod_async(self.dev[inp], self.host[inp], self.stream)
+    def infer(self, inputs):
+        if isinstance(inputs, np.ndarray):
+            if len(self.inputs) != 1:
+                raise ValueError(f"expected inputs {self.inputs}, got one array")
+            inputs = {self.inputs[0]: inputs}
+        if set(inputs) != set(self.inputs):
+            raise ValueError(f"expected TensorRT inputs {self.inputs}, got {sorted(inputs)}")
+        for name, value in inputs.items():
+            np.copyto(self.host[name], value.ravel())
+            cuda.memcpy_htod_async(self.dev[name], self.host[name], self.stream)
         self.ctx.execute_async_v3(self.stream.handle)
         outs = {}
         for i in range(self.engine.num_io_tensors):
@@ -86,6 +89,23 @@ def postprocess(scores, boxes, hw, conf=0.4, num_classes=13, topk=300):
     return xyxy, conf_v, cls
 
 
+def build_sign_rois(boxes_xyxy, classes, max_rois=32, source_class=11):
+    sign_boxes = boxes_xyxy[classes == source_class][:max_rois]
+    rois = np.zeros((max_rois, 5), dtype=np.float32)
+    rois[:len(sign_boxes), 1:] = sign_boxes
+    return rois, len(sign_boxes)
+
+
+def classify_signs(sign_model, sign_features, boxes_xyxy, classes,
+                   max_rois=32, num_classes=43):
+    rois, count = build_sign_rois(boxes_xyxy, classes, max_rois)
+    if not count:
+        return np.zeros(0, dtype=np.int64)
+    outputs = sign_model.infer({"sign_features": sign_features, "rois": rois})
+    logits = outputs["sign_logits"].reshape(max_rois, num_classes)
+    return logits[:count].argmax(1)
+
+
 def preprocess_bgr(frame: np.ndarray, hw) -> np.ndarray:
     import cv2
     h, w = hw
@@ -102,12 +122,17 @@ def main():
     ap.add_argument("--height", type=int, default=384)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--track", action="store_true")
+    ap.add_argument("--sign-engine", default=None,
+                    help="optional FP16 sign-classifier sidecar TensorRT engine")
+    ap.add_argument("--sign-max-rois", type=int, default=32)
+    ap.add_argument("--sign-num-classes", type=int, default=43)
     ap.add_argument("--video", default=None,
                     help="video path or camera index; omit for a synthetic benchmark")
     ap.add_argument("--frames", type=int, default=100)
     a = ap.parse_args()
 
     model = TRTModel(a.engine)
+    sign_model = TRTModel(a.sign_engine) if a.sign_engine else None
     tracker = BYTETracker() if a.track else None
     capture = None
     if a.video is not None:
@@ -131,9 +156,16 @@ def main():
             xyxy, conf, cls = postprocess(
                 outs["scores"], outs["boxes"], (a.height, a.width))
             tracks = tracker.update(xyxy, conf, cls) if tracker is not None else []
+            typed_classes = np.zeros(0, dtype=np.int64)
+            if sign_model is not None:
+                if "sign_features" not in outs:
+                    raise ValueError("core engine must export sign_features for the sign sidecar")
+                typed_classes = classify_signs(
+                    sign_model, outs["sign_features"], xyxy, cls,
+                    a.sign_max_rois, a.sign_num_classes)
             dt = (time.time() - t0) * 1000
             print(f"{dt:.1f} ms  ({1000/max(dt,1e-3):.0f} FPS)  "
-                  f"dets={len(conf)} tracks={len(tracks)}")
+                  f"dets={len(conf)} tracks={len(tracks)} typed_signs={len(typed_classes)}")
     finally:
         if capture is not None:
             capture.release()
