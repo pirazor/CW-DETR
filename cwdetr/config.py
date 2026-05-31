@@ -48,7 +48,7 @@ class BackboneCfg:
     num_register_tokens: int = 4
     out_layer_indices: List[int] = field(default_factory=lambda: [5, 8, 11])
     simple_fpn: bool = True
-    windowed_attention: bool = True
+    windowed_attention: bool = False
     window_block_indices: List[int] = field(default_factory=list)
     window_size: int = 8
     freeze_blocks: int = 0
@@ -90,7 +90,7 @@ class DetectionHeadCfg:
 
 @dataclass
 class TrackingCfg:
-    enabled: bool = True
+    enabled: bool = False
     mode: str = "track_query"              # track_query | bytetrack_only
     max_active_tracks: int = 200
     score_thresh: float = 0.5
@@ -115,7 +115,7 @@ class SignClsCfg:
 
 @dataclass
 class TrajectoryCfg:
-    enabled: bool = True
+    enabled: bool = False
     history_len: int = 10
     future_len: int = 12
     step_dt: float = 0.5
@@ -218,6 +218,10 @@ def validate_config(cfg: CWDETRConfig) -> None:
         raise ValueError("decoder num_feature_levels must match projector num_levels")
     if len(b.out_channels) != len(b.out_strides):
         raise ValueError("backbone out_channels and out_strides must have the same length")
+    if b.type not in ("dinov3_convnext", "dinov3_vit"):
+        raise ValueError("backbone type must be 'dinov3_convnext' or 'dinov3_vit'")
+    if b.type == "dinov3_vit" and b.windowed_attention:
+        raise ValueError("DINOv3 ViT windowed_attention is not RoPE-correct and must remain disabled")
     if b.source not in ("huggingface", "meta_hub"):
         raise ValueError("backbone source must be 'huggingface' or 'meta_hub'")
     if b.teacher_source not in (None, "huggingface", "meta_hub"):

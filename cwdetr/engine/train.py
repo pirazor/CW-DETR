@@ -102,7 +102,8 @@ def _targets_to_device(targets, device):
         if v is None:
             out[k] = None
         elif k == "detection":
-            out[k] = [{kk: vv.to(device) for kk, vv in t.items()} for t in v]
+            out[k] = [{kk: vv.to(device) if torch.is_tensor(vv) else vv
+                       for kk, vv in t.items()} for t in v]
         elif torch.is_tensor(v):
             out[k] = v.to(device)
         elif isinstance(v, list) and all(torch.is_tensor(item) for item in v):
@@ -131,7 +132,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_cwdetr(cfg).to(device)
-    teacher_dim = 768 if cfg.model.backbone.gram_anchor_distill else None
+    teacher_dim = (model.backbone.teacher_out_channels
+                   if cfg.model.backbone.gram_anchor_distill else None)
     criterion = MultiTaskCriterion(cfg.model.heads.detection.num_classes,
                                    teacher_dim=teacher_dim,
                                    student_dim=cfg.model.hidden_dim).to(device)

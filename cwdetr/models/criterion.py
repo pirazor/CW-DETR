@@ -83,7 +83,29 @@ class MultiTaskCriterion(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
+    @staticmethod
+    def _select_detection_batch(det_out, keep):
+        selected = {
+            "pred_logits": det_out["pred_logits"][keep],
+            "pred_boxes": det_out["pred_boxes"][keep],
+        }
+        selected["aux_outputs"] = [
+            {"pred_logits": aux["pred_logits"][keep], "pred_boxes": aux["pred_boxes"][keep]}
+            for aux in det_out.get("aux_outputs", [])
+        ]
+        return selected
+
     def loss_detection(self, det_out, targets) -> Dict[str, torch.Tensor]:
+        keep = [i for i, target in enumerate(targets)
+                if target.get("train_detection", True)]
+        if len(keep) != len(targets):
+            det_out = self._select_detection_batch(det_out, keep)
+            targets = [targets[i] for i in keep]
+        if not targets:
+            zero = det_out["pred_logits"].sum() * 0.0 + det_out["pred_boxes"].sum() * 0.0
+            return {"detection": zero, "det/loss_ce": zero,
+                    "det/loss_bbox": zero, "det/loss_giou": zero}
+
         all_outputs = [{"pred_logits": det_out["pred_logits"],
                         "pred_boxes": det_out["pred_boxes"]}] + det_out.get("aux_outputs", [])
         num_boxes = max(1, sum(len(t["labels"]) for t in targets))
@@ -167,6 +189,12 @@ class MultiTaskCriterion(nn.Module):
         losses: Dict[str, torch.Tensor] = {}
         det = self.loss_detection(outputs["detection"], targets["detection"])
         losses.update(det)
+        enc_out = outputs.get("enc_outputs")
+        if enc_out and "pred_logits" in enc_out:
+            enc = self.loss_detection(enc_out, targets["detection"])
+            losses["detection"] = losses["detection"] + enc["detection"]
+            losses.update({key.replace("det/", "enc_det/"): value
+                           for key, value in enc.items() if key.startswith("det/")})
 
         has_seg_target = targets.get("drivable") is not None or targets.get("lane") is not None
         losses["segmentation"] = (self.loss_segmentation(

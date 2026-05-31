@@ -3,8 +3,9 @@
 GTSRB ships pre-cropped signs (one folder per class). For those, the whole image
 is the ROI. Mapillary Traffic Sign provides full street images with sign boxes +
 fine labels; use ``MapillaryTrafficSign`` for in-context ROIs. Both yield the
-CW-DETR sample contract, populating ``sign_boxes`` + ``sign_labels`` and a single
-coarse ``traffic_sign`` detection box so the cascade is trained jointly.
+  CW-DETR sample contract, populating ``sign_boxes`` + ``sign_labels``. GTSRB
+  crops intentionally do not supervise the coarse detector because they are not
+  in-context road images.
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ from torch.utils.data import Dataset
 
 
 class GTSRBSigns(Dataset):
+    sign_taxonomy = "gtsrb43"
+
     def __init__(self, root: str, split: str = "train", transforms=None):
         self.transforms = transforms
         self.samples = []
@@ -39,11 +42,14 @@ class GTSRBSigns(Dataset):
         w, h = img.size
         sample = {
             "image": img,
-            "labels": torch.tensor([11], dtype=torch.long),       # coarse 'traffic_sign'
-            "boxes": torch.tensor([[0.5, 0.5, 1.0, 1.0]], dtype=torch.float32),
+            "labels": torch.zeros(0, dtype=torch.long),
+            "boxes": torch.zeros(0, 4, dtype=torch.float32),
+            "train_detection": False,
             "drivable": None, "lane": None,
             "sign_boxes": torch.tensor([[0, 0, w, h]], dtype=torch.float32),
             "sign_labels": torch.tensor([cls], dtype=torch.long),
+            "image_id": path,
+            "orig_size": (h, w),
             "dataset": "gtsrb",
         }
         return self.transforms(sample) if self.transforms else sample
@@ -52,10 +58,12 @@ class GTSRBSigns(Dataset):
 class MapillaryTrafficSign(Dataset):
     """Full-image signs with boxes + fine labels (annotation JSON per image)."""
 
-    def __init__(self, root: str, split: str, class_index: Dict[str, int], transforms=None):
+    def __init__(self, root: str, split: str, class_index: Dict[str, int], transforms=None,
+                 taxonomy_name: str = "mapillary"):
         self.root, self.split = root, split
         self.transforms = transforms
         self.class_index = class_index
+        self.sign_taxonomy = taxonomy_name
         with open(os.path.join(root, "splits", f"{split}.txt")) as f:
             self.ids = [ln.strip() for ln in f if ln.strip()]
 
@@ -81,9 +89,12 @@ class MapillaryTrafficSign(Dataset):
             "image": img,
             "labels": torch.full((len(dboxes),), 11, dtype=torch.long),
             "boxes": torch.as_tensor(dboxes, dtype=torch.float32).reshape(-1, 4),
+            "train_detection": True,
             "drivable": None, "lane": None,
             "sign_boxes": torch.as_tensor(sboxes, dtype=torch.float32).reshape(-1, 4),
             "sign_labels": torch.as_tensor(slabels, dtype=torch.long),
+            "image_id": img_id,
+            "orig_size": (h, w),
             "dataset": "mapillary",
         }
         return self.transforms(sample) if self.transforms else sample

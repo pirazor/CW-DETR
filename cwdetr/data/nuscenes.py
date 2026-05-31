@@ -147,6 +147,7 @@ class NuScenesSequences(Dataset):
             "image": image,
             "labels": torch.as_tensor(labels, dtype=torch.long),
             "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "train_detection": True,
             "drivable": None,
             "lane": None,
             "sign_boxes": torch.zeros(0, 4),
@@ -158,6 +159,8 @@ class NuScenesSequences(Dataset):
                             else torch.zeros(0, self.future_len)),
             "trajectory_space": self.space,
             "disable_hflip": self.space == "bev",
+            "image_id": cam_token,
+            "orig_size": (h, w),
             "dataset": "nuscenes",
         }
         return self.transforms(sample_out) if self.transforms else sample_out

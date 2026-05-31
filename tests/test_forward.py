@@ -17,8 +17,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+from torch.utils.data import Dataset
 
 from cwdetr.config import BackboneCfg, load_config, CWDETRConfig, ModelCfg
+from cwdetr.data.multitask_dataset import ConcatMultiTaskDataset
 from cwdetr.data.transforms import RandomHFlip
 from cwdetr.engine.train import build_param_groups
 from cwdetr.models.decoder.deformable_decoder import (DeformableTransformer,
@@ -61,6 +63,26 @@ class DummyMetaHubEncoder(nn.Module):
         return tuple(torch.randn(b, self.channels[stage],
                                  h // (2 ** (stage + 2)), w // (2 ** (stage + 2)))
                      for stage in stages)
+
+
+class DummyMetaHubViTEncoder(nn.Module):
+    embed_dim = 768
+
+    def get_intermediate_layers(self, x, n=1, reshape=False):
+        assert n == 1
+        b, _, h, w = x.shape
+        return (torch.randn(b, self.embed_dim, h // 16, w // 16),)
+
+
+class DummySignDataset(Dataset):
+    def __init__(self, taxonomy):
+        self.sign_taxonomy = taxonomy
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, _):
+        return {"sign_labels": torch.tensor([0])}
 
 
 def _synthetic_srcs(b=2, c=256, base_hw=(48, 80)):
@@ -120,6 +142,65 @@ def test_meta_hub_random_init_without_weights():
     print("  [ok] official Meta repository random init")
 
 
+def test_meta_hub_vit_uses_final_map_and_validates_fpn_contract():
+    cfg = BackboneCfg(
+        type="dinov3_vit", source="meta_hub", meta_model="dinov3_vitb16",
+        weights="checkpoint.pth", out_channels=[192, 384, 768],
+        out_strides=[8, 16, 32], embed_dim=768, windowed_attention=False)
+    factory = mock.Mock(return_value=DummyMetaHubViTEncoder())
+    module = SimpleNamespace(dinov3_vitb16=factory)
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        backbone = DINOv3Backbone(cfg)
+        feats = backbone(torch.randn(1, 3, 64, 96))
+    assert [tuple(f.shape) for f in feats] == [
+        (1, 192, 8, 12), (1, 384, 4, 6), (1, 768, 2, 3)]
+    print("  [ok] official Meta ViT final map + FPN contract")
+
+
+def test_backbone_stride_contract_rejects_wrong_config():
+    cfg = BackboneCfg(
+        source="meta_hub", meta_model="dinov3_convnext_tiny",
+        weights="checkpoint.pth", out_indices=[1, 2, 3],
+        out_channels=[192, 384, 768], out_strides=[4, 8, 16])
+    module = SimpleNamespace(dinov3_convnext_tiny=lambda **_: DummyMetaHubEncoder())
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        backbone = DINOv3Backbone(cfg)
+        try:
+            backbone(torch.randn(1, 3, 64, 96))
+        except ValueError as exc:
+            assert "violates contract" in str(exc)
+        else:
+            raise AssertionError("wrong backbone stride config must fail")
+    print("  [ok] backbone stride contract")
+
+
+def test_vit_windowing_fails_closed():
+    try:
+        DINOv3Backbone(BackboneCfg(type="dinov3_vit", windowed_attention=True))
+    except ValueError as exc:
+        assert "RoPE" in str(exc)
+    else:
+        raise AssertionError("unsafe ViT windowing must fail closed")
+    print("  [ok] unsafe ViT windowing disabled")
+
+
+def test_frozen_teacher_stays_in_eval_mode():
+    cfg = BackboneCfg(
+        source="meta_hub", meta_model="dinov3_convnext_tiny",
+        weights="checkpoint.pth", out_indices=[1, 2, 3],
+        out_channels=[192, 384, 768], out_strides=[8, 16, 32])
+    module = SimpleNamespace(dinov3_convnext_tiny=lambda **_: DummyMetaHubEncoder())
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        backbone = DINOv3Backbone(cfg)
+    backbone.teacher = nn.Dropout()
+    backbone.train()
+    assert not backbone.teacher.training
+    print("  [ok] frozen teacher remains eval-only")
+
+
 def test_encoder_proposal_centers():
     _, proposals = gen_encoder_output_proposals(torch.zeros(1, 4, 8), [(2, 2)])
     centers = proposals.sigmoid()[0, :, :2]
@@ -132,7 +213,7 @@ def test_encoder_proposal_centers():
 def test_transformer_and_detection_head():
     cfg = CWDETRConfig().model.decoder
     cfg.hidden_dim = 256
-    tr = DeformableTransformer(cfg)
+    tr = DeformableTransformer(cfg, num_classes=13)
     head = DetectionHead(256, num_classes=13, num_decoder_layers=cfg.num_layers)
     tr.decoder.bbox_embed = head.bbox_embed
     out = tr(_synthetic_srcs())
@@ -141,6 +222,26 @@ def test_transformer_and_detection_head():
     assert det["pred_boxes"].shape == (2, cfg.num_queries, 4)
     assert len(det["aux_outputs"]) == cfg.num_layers - 1
     print("  [ok] transformer+det head", tuple(det["pred_logits"].shape))
+
+
+def test_encoder_proposal_head_receives_gradients():
+    cfg = CWDETRConfig().model.decoder
+    tr = DeformableTransformer(cfg, num_classes=13)
+    head = DetectionHead(256, num_classes=13, num_decoder_layers=cfg.num_layers)
+    tr.decoder.bbox_embed = head.bbox_embed
+    dec = tr(_synthetic_srcs(b=1))
+    det = head(dec["hs"], dec["inter_references"])
+    crit = MultiTaskCriterion(num_classes=13)
+    outputs = {"detection": det, "enc_outputs": dec["enc_outputs"]}
+    targets = {"detection": [
+        {"labels": torch.tensor([0, 5]), "boxes": torch.rand(2, 4)}
+    ]}
+    crit(outputs, targets)["total"].backward()
+    for parameter in (tr.enc_class_embed.weight, tr.enc_bbox.layers[-1].weight,
+                      tr.enc_output.weight):
+        assert parameter.grad is not None
+        assert parameter.grad.abs().sum() > 0
+    print("  [ok] supervised encoder proposal gradients")
 
 
 def test_matcher_and_criterion():
@@ -181,6 +282,49 @@ def test_criterion_skips_absent_segmentation_targets():
     assert losses["segmentation"] is None
     assert torch.isfinite(losses["total"])
     print("  [ok] criterion skips absent segmentation targets")
+
+
+def test_criterion_skips_crop_only_detection_but_trains_signs():
+    crit = MultiTaskCriterion(num_classes=13)
+    logits = torch.randn(1, 8, 13, requires_grad=True)
+    boxes = torch.rand(1, 8, 4, requires_grad=True)
+    sign_logits = torch.randn(1, 43, requires_grad=True)
+    outputs = {
+        "detection": {"pred_logits": logits, "pred_boxes": boxes, "aux_outputs": []},
+        "sign_logits": sign_logits,
+    }
+    targets = {
+        "detection": [{
+            "labels": torch.zeros(0, dtype=torch.long),
+            "boxes": torch.zeros(0, 4),
+            "train_detection": False,
+        }],
+        "sign_labels": torch.tensor([3]),
+    }
+    losses = crit(outputs, targets)
+    losses["total"].backward()
+    assert losses["detection"] == 0
+    assert losses["sign"] > 0
+    assert logits.grad is not None and logits.grad.abs().sum() == 0
+    assert boxes.grad is not None and boxes.grad.abs().sum() == 0
+    assert sign_logits.grad is not None and sign_logits.grad.abs().sum() > 0
+    print("  [ok] crop-only sign data bypasses detector loss")
+
+
+def test_mixed_sign_taxonomies_require_explicit_mapping():
+    try:
+        ConcatMultiTaskDataset([DummySignDataset("gtsrb43"),
+                                DummySignDataset("mapillary")])
+    except ValueError as exc:
+        assert "sign_label_maps" in str(exc)
+    else:
+        raise AssertionError("mixed fine-sign taxonomies must require explicit maps")
+    dataset = ConcatMultiTaskDataset(
+        [DummySignDataset("gtsrb43"), DummySignDataset("mapillary")],
+        sign_label_maps={"gtsrb43": {0: 4}, "mapillary": {0: 8}})
+    assert dataset[0]["sign_labels"].tolist() == [4]
+    assert dataset[1]["sign_labels"].tolist() == [8]
+    print("  [ok] mixed sign taxonomy validation")
 
 
 def test_optimizer_groups_include_criterion_parameters():
@@ -273,9 +417,13 @@ def test_full_model_with_dummy_backbone():
 
 ARGS = None
 TESTS = [test_deform_attn, test_config_load_nested_dataclasses, test_meta_hub_backbone_loader,
-         test_meta_hub_random_init_without_weights,
-         test_encoder_proposal_centers, test_transformer_and_detection_head,
+         test_meta_hub_random_init_without_weights, test_meta_hub_vit_uses_final_map_and_validates_fpn_contract,
+         test_backbone_stride_contract_rejects_wrong_config, test_vit_windowing_fails_closed,
+         test_frozen_teacher_stays_in_eval_mode, test_encoder_proposal_centers,
+         test_transformer_and_detection_head, test_encoder_proposal_head_receives_gradients,
          test_matcher_and_criterion, test_criterion_skips_absent_segmentation_targets,
+         test_criterion_skips_crop_only_detection_but_trains_signs,
+         test_mixed_sign_taxonomies_require_explicit_mapping,
          test_optimizer_groups_include_criterion_parameters, test_track_query_miss_tolerance,
          test_bytetrack_class_gating, test_image_trajectory_flip, test_trajectory_and_sign_heads,
          test_full_model_with_dummy_backbone]
