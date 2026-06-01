@@ -12,7 +12,7 @@ from cwdetr.data.traffic_signs import GTSRBSigns
 from cwdetr.data.transforms import RandomScaleCrop
 from cwdetr.engine.evaluate import (METRIC_KEYS, BinaryLaneMetrics, SemanticMetrics,
                                     SignTop1, evaluate_loader)
-from cwdetr.engine.train import _checkpoint_state
+from cwdetr.engine.train import _checkpoint_state, train_one_epoch
 from cwdetr.engine.utils import ModelEMA, build_warmup_cosine_scheduler
 
 
@@ -166,3 +166,41 @@ def test_warmup_cosine_scheduler_and_ema_checkpoint_state():
     assert state["epoch"] == 2
     assert state["global_step"] == 9
     assert state["best_detection_map"] == 0.4
+
+
+def test_train_one_epoch_emits_flushed_batch_summary(capsys):
+    class TrainModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, images, sign_rois=None, detection_targets=None):
+            return {"score": self.weight * images.sum()}
+
+    class TrainCriterion(nn.Module):
+        def forward(self, outputs, targets, student_feat=None, teacher_feat=None):
+            loss = outputs["score"] ** 2
+            return {"total": loss, "detection": loss}
+
+    cfg = CWDETRConfig()
+    model = TrainModel()
+    criterion = TrainCriterion()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    loader = [{
+        "images": torch.ones(1, 3, 2, 2),
+        "targets": {
+            "detection": [{"labels": torch.zeros(0, dtype=torch.long),
+                           "boxes": torch.zeros(0, 4)}],
+            "drivable": None,
+            "lane": None,
+            "sign_labels": torch.zeros(0, dtype=torch.long),
+        },
+        "extras": {"sign_rois": torch.zeros(0, 5), "dataset": "synthetic"},
+    }]
+    step = train_one_epoch(
+        model, criterion, loader, optimizer, scaler, torch.device("cpu"), cfg,
+        epoch=0, log_every=1, num_epochs=1)
+    output = capsys.readouterr().out
+    assert step == 1
+    assert "[train] epoch=1 batch=1/1 step=1" in output

@@ -20,6 +20,12 @@ from cwdetr.engine.utils import (ModelEMA, build_warmup_cosine_scheduler,
                                  targets_to_device, unwrap_module)
 from cwdetr.models.criterion import MultiTaskCriterion
 from cwdetr.models.cwdetr import build_cwdetr
+from cwdetr.utils.progress import progress, progress_write
+
+
+def _log(message, rank=0):
+    if rank == 0:
+        print(f"[train] {message}", flush=True)
 
 
 def build_param_groups(model, base_lr, criterion=None, backbone_lr_mult=0.1, wd=1e-4):
@@ -74,7 +80,7 @@ def _summary_writer(log_dir, rank):
         from torch.utils.tensorboard import SummaryWriter
         return SummaryWriter(log_dir)
     except ImportError:
-        print("[train] tensorboard is unavailable; scalar event logging disabled")
+        _log("tensorboard is unavailable; scalar event logging disabled", rank)
         return None
 
 
@@ -136,12 +142,16 @@ def _load_resume(path, model, criterion, optimizer, scheduler, scaler, ema):
 
 def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, epoch,
                     scheduler=None, ema: Optional[ModelEMA] = None, writer=None,
-                    global_step=0, clip=0.1, log_every=50, rank=0):
+                    global_step=0, clip=0.1, log_every=10, rank=0,
+                    num_epochs=None):
     model.train()
     criterion.train()
     raw_model = unwrap_module(model)
     distill_on = cfg.model.backbone.gram_anchor_distill
-    for iteration, batch in enumerate(loader):
+    epoch_label = f"{epoch + 1}/{num_epochs}" if num_epochs is not None else str(epoch + 1)
+    iterator = progress(loader, desc=f"train epoch {epoch_label}", dynamic_ncols=True,
+                        disable=rank != 0)
+    for iteration, batch in enumerate(iterator):
         images = batch["images"].to(device, non_blocking=True)
         targets = targets_to_device(batch["targets"], device)
         sign_rois = batch["extras"]["sign_rois"].to(device)
@@ -176,9 +186,13 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
             active = " ".join(
                 f"{key}={value:.3f}" for key, value in scalars.items()
                 if key in ("detection", "segmentation", "sign", "distill"))
-            print(f"[ep{epoch} it{iteration}/{len(loader)}] total={scalars['total']:.3f} "
-                  f"lr={optimizer.param_groups[0]['lr']:.2e} "
-                  f"({batch['extras']['dataset']}) {active}")
+            message = (f"epoch={epoch + 1} batch={iteration + 1}/{len(loader)} "
+                       f"step={global_step} total={scalars['total']:.3f} "
+                       f"lr={optimizer.param_groups[0]['lr']:.2e} "
+                       f"dataset={batch['extras']['dataset']} {active}")
+            iterator.set_postfix(total=f"{scalars['total']:.3f}",
+                                 lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            progress_write(f"[train] {message}")
     return global_step
 
 
@@ -204,28 +218,46 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--max-eval-batches", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=10,
+                        help="emit a flushed training summary every N batches")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--out", default="checkpoints")
     args = parser.parse_args()
+    if args.log_every <= 0:
+        parser.error("--log-every must be positive")
 
     rank, world_size, local_rank, device = _distributed_context()
+    _log(f"starting rank={rank}/{world_size} device={device}", rank)
+    if rank == 0 and device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        _log(f"gpu={props.name} memory={props.total_memory / 1024 ** 3:.1f} GiB", rank)
     seed_everything(args.seed + rank)
+    _log(f"loading config {args.config}", rank)
     cfg = load_config(args.config)
 
+    _log("building model and loading backbone weights", rank)
     model = build_cwdetr(cfg).to(device)
+    trainable = sum(parameter.numel() for parameter in model.parameters()
+                    if parameter.requires_grad)
+    _log(f"model ready: {trainable / 1e6:.2f}M trainable parameters", rank)
     teacher_dim = (model.backbone.teacher_out_channels
                    if cfg.model.backbone.gram_anchor_distill else None)
     criterion = MultiTaskCriterion(cfg.model.heads.detection.num_classes,
                                    teacher_dim=teacher_dim,
                                    student_dim=cfg.model.hidden_dim,
                                    dn_loss_weight=cfg.model.decoder.dn_loss_weight).to(device)
+    _log("building training datasets", rank)
     dataset, weights = build_datasets(cfg, args)
+    _log(f"training dataset ready: {len(dataset)} samples", rank)
     sampler = MixedBatchSampler(dataset, args.batch_size, weights, seed=args.seed,
                                 rank=rank, world_size=world_size)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=args.workers,
                         collate_fn=collate_fn, pin_memory=device.type == "cuda",
                         worker_init_fn=make_worker_init_fn(args.seed, rank))
+    _log(f"training loader ready: {len(loader)} batches/epoch batch_size={args.batch_size} "
+         f"workers={args.workers}", rank)
 
+    _log("building optimizer, scheduler, scaler, and EMA", rank)
     optimizer = torch.optim.AdamW(build_param_groups(model, args.lr, criterion))
     scheduler = build_warmup_cosine_scheduler(
         optimizer, args.warmup_steps, args.epochs * max(1, len(loader)))
@@ -233,8 +265,10 @@ def main():
     ema = ModelEMA(model, args.ema_decay)
     start_epoch, global_step, best_map = 0, 0, float("-inf")
     if args.resume:
+        _log(f"resuming checkpoint {args.resume}", rank)
         start_epoch, global_step, best_map = _load_resume(
             args.resume, model, criterion, optimizer, scheduler, scaler, ema)
+        _log(f"resume ready: start_epoch={start_epoch + 1} global_step={global_step}", rank)
 
     if world_size > 1:
         ddp_kwargs = {"find_unused_parameters": True}
@@ -244,9 +278,11 @@ def main():
         criterion = DDP(criterion, **ddp_kwargs)
 
     os.makedirs(args.out, exist_ok=True)
+    _log(f"writing logs and checkpoints to {args.out}", rank)
     writer = _summary_writer(os.path.join(args.out, "tensorboard"), rank)
     val_loader = None
     if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
+        _log("building validation datasets", rank)
         val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root,
                                          args.yolo_data, args.refresh_yolo_index)
         val_loader = DataLoader(
@@ -254,19 +290,23 @@ def main():
             num_workers=args.workers, collate_fn=collate_fn,
             pin_memory=device.type == "cuda",
             worker_init_fn=make_worker_init_fn(args.seed))
+        _log(f"validation loader ready: {len(val_dataset)} samples, "
+             f"{len(val_loader)} batches", rank)
 
     for epoch in range(start_epoch, args.epochs):
+        _log(f"starting epoch {epoch + 1}/{args.epochs}", rank)
         sampler.set_epoch(epoch)
         global_step = train_one_epoch(
             model, criterion, loader, optimizer, scaler, device, cfg, epoch,
             scheduler=scheduler, ema=ema, writer=writer, global_step=global_step,
-            rank=rank)
+            log_every=args.log_every, rank=rank, num_epochs=args.epochs)
 
         metrics = None
         if rank == 0 and val_loader is not None and (epoch + 1) % args.eval_every == 0:
+            _log(f"evaluating EMA model after epoch {epoch + 1}", rank)
             metrics = evaluate_loader(
                 ema.module, val_loader, device, cfg.model.heads.detection.num_classes,
-                args.max_eval_batches)
+                args.max_eval_batches, progress=True)
             print_metrics(metrics)
             if writer is not None:
                 for key, value in metrics.items():
@@ -283,7 +323,7 @@ def main():
             torch.save(state, epoch_path)
             if is_best:
                 torch.save(state, os.path.join(args.out, "best_detection_map.pth"))
-            print(f"saved checkpoint for epoch {epoch}")
+            _log(f"saved checkpoint {epoch_path}", rank)
         if world_size > 1:
             dist.barrier()
 

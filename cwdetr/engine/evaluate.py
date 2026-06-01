@@ -15,6 +15,7 @@ from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
                          build_transforms, collate_fn, YoloDetectionDataset)
 from cwdetr.engine.utils import targets_to_device
 from cwdetr.models.cwdetr import build_cwdetr
+from cwdetr.utils.progress import progress as iter_progress
 
 
 METRIC_KEYS = (
@@ -178,14 +179,17 @@ def empty_metrics() -> Dict[str, float]:
 
 @torch.no_grad()
 def evaluate_loader(model, loader, device, num_classes: int,
-                    max_batches: Optional[int] = None) -> Dict[str, float]:
+                    max_batches: Optional[int] = None,
+                    progress: bool = False) -> Dict[str, float]:
     model.eval()
     detection = CocoDetectionMetrics(num_classes)
     drivable = SemanticMetrics(3)
     lane = BinaryLaneMetrics()
     signs = SignTop1()
 
-    for batch_index, batch in enumerate(loader):
+    progress_bar = iter_progress(
+        loader, desc="validate", dynamic_ncols=True, disable=not progress)
+    for batch_index, batch in enumerate(progress_bar):
         if max_batches is not None and batch_index >= max_batches:
             break
         images = batch["images"].to(device, non_blocking=True)
@@ -264,7 +268,7 @@ def main():
                         pin_memory=device.type == "cuda")
     metrics = evaluate_loader(model, loader, device,
                               cfg.model.heads.detection.num_classes,
-                              args.max_batches)
+                              args.max_batches, progress=True)
     print_metrics(metrics)
 
 

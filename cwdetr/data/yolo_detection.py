@@ -30,12 +30,17 @@ import torch
 import yaml
 from PIL import Image
 from torch.utils.data import Dataset
+from cwdetr.utils.progress import progress
 
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 TRANSIENT_IO_ERRNOS = {5, 16, 110, 116}
 LABEL_CACHE_VERSION = 1
 T = TypeVar("T")
+
+
+def _log(split: str, message: str) -> None:
+    print(f"[yolo:{split}] {message}", flush=True)
 
 
 def _retry_remote_io(action: Callable[[], T], description: str,
@@ -145,8 +150,10 @@ class YoloDetectionDataset(Dataset):
                     raise ValueError(f"invalid path in YOLO image manifest: {relative!r}")
                 images.append(self.image_dir / relative_path)
             if images:
+                _log(self.split, f"loaded {len(images)} image paths from {self.index_path}")
                 return images
 
+        _log(self.split, f"scanning image paths under {self.image_dir}")
         self.images = sorted(
             path for path in self.image_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
@@ -156,6 +163,7 @@ class YoloDetectionDataset(Dataset):
             _retry_remote_io(
                 lambda: self.index_path.write_text(contents, encoding="utf-8"),
                 f"writing YOLO image manifest {self.index_path}")
+            _log(self.split, f"cached {len(self.images)} image paths in {self.index_path}")
         return self.images
 
     def __len__(self) -> int:
@@ -245,6 +253,7 @@ class YoloDetectionDataset(Dataset):
         rows = payload.get("labels")
         if not isinstance(rows, list) or len(rows) != len(self.images):
             return None
+        _log(self.split, f"loaded {len(rows)} parsed labels from {self.label_cache_path}")
         return [self._rows_to_tensors(item, self.label_cache_path) for item in rows]
 
     def _image_lookup_key(self, path) -> str:
@@ -282,6 +291,7 @@ class YoloDetectionDataset(Dataset):
         relative_images = self._relative_images()
         if not cached or any(relative not in cached for relative in relative_images):
             return None
+        _log(self.split, f"imported {len(cached)} parsed labels from {self.ultralytics_cache_path}")
         return [cached[relative] for relative in relative_images]
 
     def _save_label_cache(self, labels) -> None:
@@ -305,9 +315,15 @@ class YoloDetectionDataset(Dataset):
                 self._save_label_cache(cached)
                 return cached
         workers = min(8, os.cpu_count() or 1, len(self.images))
+        _log(self.split, f"building parsed-label cache from {len(self.images)} YOLO files "
+             f"with {workers} threads")
         with ThreadPool(workers) as pool:
-            labels = pool.map(self._load_label_file, self.images)
+            labels = list(progress(
+                pool.imap(self._load_label_file, self.images),
+                total=len(self.images), desc=f"cache labels ({self.split})",
+                dynamic_ncols=True))
         self._save_label_cache(labels)
+        _log(self.split, f"cached parsed labels in {self.label_cache_path}")
         return labels
 
     def __getitem__(self, index: int) -> Dict:
