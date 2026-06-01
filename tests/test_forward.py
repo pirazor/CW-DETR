@@ -176,6 +176,22 @@ def test_backbone_stride_contract_rejects_wrong_config():
     print("  [ok] backbone stride contract")
 
 
+def test_hf_convnext_automodel_fallback_selects_stride_contract():
+    image = torch.randn(2, 3, 384, 640)
+    hidden_states = (
+        torch.randn(2, 96, 96, 160),
+        torch.randn(2, 96, 96, 160),
+        torch.randn(2, 192, 48, 80),
+        torch.randn(2, 384, 24, 40),
+        torch.randn(2, 768, 12, 20),
+    )
+    feats = DINOv3Backbone._select_convnext_features(
+        image, hidden_states, [192, 384, 768], [8, 16, 32])
+    assert [tuple(feat.shape) for feat in feats] == [
+        (2, 192, 48, 80), (2, 384, 24, 40), (2, 768, 12, 20)]
+    print("  [ok] HF ConvNeXt AutoModel fallback stage selection")
+
+
 def test_vit_windowing_fails_closed():
     try:
         DINOv3Backbone(BackboneCfg(type="dinov3_vit", windowed_attention=True))
@@ -418,7 +434,8 @@ def test_full_model_with_dummy_backbone():
 ARGS = None
 TESTS = [test_deform_attn, test_config_load_nested_dataclasses, test_meta_hub_backbone_loader,
          test_meta_hub_random_init_without_weights, test_meta_hub_vit_uses_final_map_and_validates_fpn_contract,
-         test_backbone_stride_contract_rejects_wrong_config, test_vit_windowing_fails_closed,
+         test_backbone_stride_contract_rejects_wrong_config,
+         test_hf_convnext_automodel_fallback_selects_stride_contract, test_vit_windowing_fails_closed,
          test_frozen_teacher_stays_in_eval_mode, test_encoder_proposal_centers,
          test_transformer_and_detection_head, test_encoder_proposal_head_receives_gradients,
          test_matcher_and_criterion, test_criterion_skips_absent_segmentation_targets,
