@@ -16,7 +16,7 @@ from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
                          collate_fn, YoloDetectionDataset)
 from cwdetr.engine.evaluate import build_eval_dataset, evaluate_loader, print_metrics
 from cwdetr.engine.utils import (ModelEMA, build_warmup_cosine_scheduler,
-                                 make_worker_init_fn, seed_everything,
+                                 dataloader_worker_kwargs, seed_everything,
                                  targets_to_device, unwrap_module)
 from cwdetr.models.criterion import MultiTaskCriterion
 from cwdetr.models.cwdetr import build_cwdetr
@@ -252,6 +252,10 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=0.9998)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="batches prefetched per worker when --workers > 0")
+    parser.add_argument("--no-persistent-workers", action="store_true",
+                        help="disable persistent DataLoader workers between epochs")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=10,
@@ -265,6 +269,8 @@ def main():
     args = parser.parse_args()
     if args.log_every <= 0:
         parser.error("--log-every must be positive")
+    if args.workers < 0 or args.prefetch_factor <= 0:
+        parser.error("--workers must be non-negative and --prefetch-factor must be positive")
     if args.step_checkpoint_every < 0:
         parser.error("--step-checkpoint-every must be non-negative")
     if args.backbone_lr_mult < 0 or args.weight_decay < 0 or args.clip_grad_norm <= 0:
@@ -276,6 +282,8 @@ def main():
     if rank == 0 and device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
         _log(f"gpu={props.name} memory={props.total_memory / 1024 ** 3:.1f} GiB", rank)
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     seed_everything(args.seed + rank)
     _log(f"loading config {args.config}", rank)
     cfg = load_config(args.config)
@@ -296,11 +304,11 @@ def main():
     _log(f"training dataset ready: {len(dataset)} samples", rank)
     sampler = MixedBatchSampler(dataset, args.batch_size, weights, seed=args.seed,
                                 rank=rank, world_size=world_size)
-    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=args.workers,
-                        collate_fn=collate_fn, pin_memory=device.type == "cuda",
-                        worker_init_fn=make_worker_init_fn(args.seed, rank))
+    loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn,
+                        **dataloader_worker_kwargs(args, device, args.seed, rank))
     _log(f"training loader ready: {len(loader)} batches/epoch batch_size={args.batch_size} "
-         f"workers={args.workers}", rank)
+         f"workers={args.workers} prefetch={args.prefetch_factor if args.workers else 0} "
+         f"persistent_workers={args.workers > 0 and not args.no_persistent_workers}", rank)
 
     _log("building optimizer, scheduler, scaler, and EMA", rank)
     optimizer = torch.optim.AdamW(build_param_groups(
@@ -329,6 +337,9 @@ def main():
     if rank == 0 and args.step_checkpoint_every:
         _log(f"overwriting {os.path.join(args.out, 'last_step.pth')} every "
              f"{args.step_checkpoint_every} optimizer step(s)", rank)
+        if "/content/drive" in args.out.replace("\\", "/").lower() and args.step_checkpoint_every == 1:
+            _log("WARNING: full per-step checkpoints on Google Drive can dominate runtime. "
+                 "Use --step-checkpoint-every 50 or 100 for higher GPU utilization.", rank)
     writer = _summary_writer(os.path.join(args.out, "tensorboard"), rank)
     val_loader = None
     if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
@@ -337,9 +348,8 @@ def main():
                                          args.yolo_data, args.refresh_yolo_index)
         val_loader = DataLoader(
             val_dataset, batch_size=args.eval_batch_size, shuffle=False,
-            num_workers=args.workers, collate_fn=collate_fn,
-            pin_memory=device.type == "cuda",
-            worker_init_fn=make_worker_init_fn(args.seed))
+            collate_fn=collate_fn,
+            **dataloader_worker_kwargs(args, device, args.seed))
         _log(f"validation loader ready: {len(val_dataset)} samples, "
              f"{len(val_loader)} batches", rank)
 

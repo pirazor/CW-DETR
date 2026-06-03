@@ -152,10 +152,12 @@ optimizer step, plus `last_epoch.pth`, numbered epoch checkpoints, and
 disable per-step checkpointing, or `--keep-step-checkpoints` only if you want
 numbered step files.
 
-For Google Drive-backed Colab runs, start with `--workers 0`; this reads data in
-the main process and is easiest to debug. Try `--workers 2` only after Drive is
-stable. Use `4+` workers for local SSDs, because each worker performs parallel
-image reads and can overwhelm mounted Drive.
+For Google Drive-backed Colab runs, `--workers 0` is easiest to debug but often
+starves a large GPU. Try `--workers 4 --prefetch-factor 4` or `--workers 8` when
+Drive is stable; each worker prepares prefetched batches while the GPU trains.
+If I/O errors return, lower workers first. Exact per-step full checkpoints to
+Drive are also expensive, so use `--step-checkpoint-every 50` or `100` for
+throughput and set it back to `1` only when exact step recovery is required.
 
 Colab workflow:
 **[`notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb`](notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb)**.

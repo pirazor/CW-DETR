@@ -54,6 +54,18 @@ def make_worker_init_fn(seed: int, rank: int = 0):
     return partial(_seed_worker, seed=seed, rank=rank)
 
 
+def dataloader_worker_kwargs(args, device, seed: int, rank: int = 0):
+    kwargs = {
+        "num_workers": args.workers,
+        "pin_memory": device.type == "cuda",
+        "worker_init_fn": make_worker_init_fn(seed, rank),
+    }
+    if args.workers > 0:
+        kwargs["prefetch_factor"] = args.prefetch_factor
+        kwargs["persistent_workers"] = not args.no_persistent_workers
+    return kwargs
+
+
 def build_warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int):
     total_steps = max(1, total_steps)
     warmup_steps = min(max(0, warmup_steps), total_steps - 1)

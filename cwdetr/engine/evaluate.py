@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from cwdetr.config import load_config
 from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
                          build_transforms, collate_fn, YoloDetectionDataset)
-from cwdetr.engine.utils import targets_to_device
+from cwdetr.engine.utils import dataloader_worker_kwargs, targets_to_device
 from cwdetr.models.cwdetr import build_cwdetr
 from cwdetr.utils.progress import progress as iter_progress
 
@@ -251,8 +251,12 @@ def main():
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--max-batches", type=int, default=None)
     args = parser.parse_args()
+    if args.workers < 0 or args.prefetch_factor <= 0:
+        parser.error("--workers must be non-negative and --prefetch-factor must be positive")
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -264,8 +268,8 @@ def main():
     dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data,
                                  args.refresh_yolo_index)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.workers, collate_fn=collate_fn,
-                        pin_memory=device.type == "cuda")
+                        collate_fn=collate_fn,
+                        **dataloader_worker_kwargs(args, device, seed=1337))
     metrics = evaluate_loader(model, loader, device,
                               cfg.model.heads.detection.num_classes,
                               args.max_batches, progress=True)
