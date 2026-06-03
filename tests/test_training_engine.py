@@ -164,8 +164,18 @@ def test_warmup_cosine_scheduler_and_ema_checkpoint_state():
     state = _checkpoint_state(model, criterion, optimizer, scheduler, scaler, ema,
                               cfg, epoch=2, global_step=9, best_map=0.4)
     assert state["epoch"] == 2
+    assert state["resume_epoch"] == 3
+    assert state["resume_iteration"] == 0
     assert state["global_step"] == 9
     assert state["best_detection_map"] == 0.4
+
+    step_state = _checkpoint_state(
+        model, criterion, optimizer, scheduler, scaler, ema, cfg,
+        epoch=2, global_step=10, best_map=0.4, checkpoint_kind="step",
+        resume_epoch=2, resume_iteration=7)
+    assert step_state["checkpoint_kind"] == "step"
+    assert step_state["resume_epoch"] == 2
+    assert step_state["resume_iteration"] == 7
 
 
 def test_train_one_epoch_emits_flushed_batch_summary(capsys):
@@ -180,7 +190,9 @@ def test_train_one_epoch_emits_flushed_batch_summary(capsys):
     class TrainCriterion(nn.Module):
         def forward(self, outputs, targets, student_feat=None, teacher_feat=None):
             loss = outputs["score"] ** 2
-            return {"total": loss, "detection": loss}
+            return {"total": loss, "detection": loss,
+                    "det/precision": loss.new_tensor(0.75),
+                    "det/mean_score": loss.new_tensor(0.6)}
 
     cfg = CWDETRConfig()
     model = TrainModel()
@@ -198,9 +210,11 @@ def test_train_one_epoch_emits_flushed_batch_summary(capsys):
         },
         "extras": {"sign_rois": torch.zeros(0, 5), "dataset": "synthetic"},
     }]
-    step = train_one_epoch(
+    step, summary = train_one_epoch(
         model, criterion, loader, optimizer, scaler, torch.device("cpu"), cfg,
         epoch=0, log_every=1, num_epochs=1)
     output = capsys.readouterr().out
     assert step == 1
     assert "[train] epoch=1 batch=1/1 step=1" in output
+    assert "det/precision=0.750" in output
+    assert summary["det/precision"] == 0.75

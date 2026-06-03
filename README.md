@@ -146,6 +146,16 @@ The first run caches per-split image manifests and parsed labels beside
 on mounted Google Drive. Existing Ultralytics `labels.cache` files are imported
 when available. Pass `--refresh-yolo-index` after adding, removing, or editing
 images or labels. The adapter retries transient mounted-drive read failures.
+Training writes `last_step.pth` in the run directory by default after every
+optimizer step, plus `last_epoch.pth`, numbered epoch checkpoints, and
+`best_detection_map.pth` after validation. Use `--step-checkpoint-every 0` to
+disable per-step checkpointing, or `--keep-step-checkpoints` only if you want
+numbered step files.
+
+For Google Drive-backed Colab runs, start with `--workers 0`; this reads data in
+the main process and is easiest to debug. Try `--workers 2` only after Drive is
+stable. Use `4+` workers for local SSDs, because each worker performs parallel
+image reads and can overwhelm mounted Drive.
 
 Colab workflow:
 **[`notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb`](notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb)**.

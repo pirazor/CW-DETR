@@ -234,9 +234,9 @@ def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None,
 
 def print_metrics(metrics: Dict[str, float]) -> None:
     width = max(len(key) for key in METRIC_KEYS)
-    print("CW-DETR validation metrics")
+    print("CW-DETR validation metrics", flush=True)
     for key in METRIC_KEYS:
-        print(f"  {key:<{width}}  {metrics[key]:.4f}")
+        print(f"  {key:<{width}}  {metrics[key]:.4f}", flush=True)
 
 
 def main():

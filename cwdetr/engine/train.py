@@ -100,7 +100,8 @@ def _distributed_context():
 
 
 def _checkpoint_state(model, criterion, optimizer, scheduler, scaler, ema,
-                      cfg, epoch, global_step, best_map):
+                      cfg, epoch, global_step, best_map, checkpoint_kind="epoch",
+                      resume_epoch=None, resume_iteration=0):
     model_state = {
         name: value for name, value in unwrap_module(model).state_dict().items()
         if not name.startswith("backbone.teacher.")
@@ -118,8 +119,11 @@ def _checkpoint_state(model, criterion, optimizer, scheduler, scaler, ema,
         "scaler": scaler.state_dict(),
         "cfg": config_to_dict(cfg),
         "epoch": epoch,
+        "resume_epoch": epoch + 1 if resume_epoch is None else resume_epoch,
+        "resume_iteration": resume_iteration,
         "global_step": global_step,
         "best_detection_map": best_map,
+        "checkpoint_kind": checkpoint_kind,
     }
 
 
@@ -136,22 +140,32 @@ def _load_resume(path, model, criterion, optimizer, scheduler, scaler, ema):
         scheduler.load_state_dict(checkpoint["scheduler"])
     if "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
-    return (checkpoint.get("epoch", -1) + 1, checkpoint.get("global_step", 0),
-            checkpoint.get("best_detection_map", float("-inf")))
+    return (checkpoint.get("resume_epoch", checkpoint.get("epoch", -1) + 1),
+            checkpoint.get("global_step", 0),
+            checkpoint.get("best_detection_map", float("-inf")),
+            checkpoint.get("resume_iteration", 0))
 
 
 def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, epoch,
                     scheduler=None, ema: Optional[ModelEMA] = None, writer=None,
                     global_step=0, clip=0.1, log_every=10, rank=0,
-                    num_epochs=None):
+                    num_epochs=None, start_iteration=0, checkpoint_callback=None):
     model.train()
     criterion.train()
     raw_model = unwrap_module(model)
     distill_on = cfg.model.backbone.gram_anchor_distill
+    if start_iteration >= len(loader):
+        _log(f"resuming epoch {epoch + 1}: all {len(loader)} batches already completed", rank)
+        return global_step, {}
     epoch_label = f"{epoch + 1}/{num_epochs}" if num_epochs is not None else str(epoch + 1)
     iterator = progress(loader, desc=f"train epoch {epoch_label}", dynamic_ncols=True,
                         disable=rank != 0)
+    if start_iteration:
+        _log(f"resuming epoch {epoch + 1}: skipping {start_iteration} completed batches", rank)
+    accum, count = {}, 0
     for iteration, batch in enumerate(iterator):
+        if iteration < start_iteration:
+            continue
         images = batch["images"].to(device, non_blocking=True)
         targets = targets_to_device(batch["targets"], device)
         sign_rois = batch["extras"]["sign_rois"].to(device)
@@ -178,22 +192,40 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
 
         scalars = {key: float(value.detach()) for key, value in losses.items()
                    if torch.is_tensor(value) and value.ndim == 0}
+        count += 1
+        for key, value in scalars.items():
+            accum[key] = accum.get(key, 0.0) + value
         if writer is not None:
             for key, value in scalars.items():
                 writer.add_scalar(f"train/{key}", value, global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+        precision = scalars.get("det/precision", 0.0)
+        iterator.set_postfix(
+            loss=f"{scalars.get('total', 0.0):.3f}",
+            det=f"{scalars.get('detection', 0.0):.3f}",
+            prec=f"{precision:.3f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+        if checkpoint_callback is not None:
+            checkpoint_callback(epoch, iteration, global_step)
         if rank == 0 and iteration % log_every == 0:
             active = " ".join(
                 f"{key}={value:.3f}" for key, value in scalars.items()
-                if key in ("detection", "segmentation", "sign", "distill"))
+                if key in ("detection", "det/precision", "det/mean_score",
+                           "segmentation", "sign", "distill"))
             message = (f"epoch={epoch + 1} batch={iteration + 1}/{len(loader)} "
                        f"step={global_step} total={scalars['total']:.3f} "
                        f"lr={optimizer.param_groups[0]['lr']:.2e} "
                        f"dataset={batch['extras']['dataset']} {active}")
-            iterator.set_postfix(total=f"{scalars['total']:.3f}",
-                                 lr=f"{optimizer.param_groups[0]['lr']:.2e}")
             progress_write(f"[train] {message}")
-    return global_step
+    summary = {key: value / max(1, count) for key, value in accum.items()}
+    if rank == 0:
+        progress_write(
+            "[train] epoch_summary "
+            f"epoch={epoch + 1} total={summary.get('total', 0.0):.4f} "
+            f"detection={summary.get('detection', 0.0):.4f} "
+            f"precision={summary.get('det/precision', 0.0):.4f} "
+            f"mean_score={summary.get('det/mean_score', 0.0):.4f}")
+    return global_step, summary
 
 
 def main():
@@ -212,6 +244,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--backbone-lr-mult", type=float, default=0.1,
+                        help="backbone LR multiplier; 0.1 gives 2e-5 for lr=2e-4")
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--clip-grad-norm", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--ema-decay", type=float, default=0.9998)
     parser.add_argument("--seed", type=int, default=1337)
@@ -220,11 +256,20 @@ def main():
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=10,
                         help="emit a flushed training summary every N batches")
+    parser.add_argument("--step-checkpoint-every", type=int, default=1,
+                        help="overwrite last_step.pth every N optimizer steps; 0 disables")
+    parser.add_argument("--keep-step-checkpoints", action="store_true",
+                        help="also keep numbered step_XXXXXXXX.pth checkpoints")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--out", default="checkpoints")
     args = parser.parse_args()
     if args.log_every <= 0:
         parser.error("--log-every must be positive")
+    if args.step_checkpoint_every < 0:
+        parser.error("--step-checkpoint-every must be non-negative")
+    if args.backbone_lr_mult < 0 or args.weight_decay < 0 or args.clip_grad_norm <= 0:
+        parser.error("--backbone-lr-mult and --weight-decay must be non-negative; "
+                     "--clip-grad-norm must be positive")
 
     rank, world_size, local_rank, device = _distributed_context()
     _log(f"starting rank={rank}/{world_size} device={device}", rank)
@@ -258,17 +303,19 @@ def main():
          f"workers={args.workers}", rank)
 
     _log("building optimizer, scheduler, scaler, and EMA", rank)
-    optimizer = torch.optim.AdamW(build_param_groups(model, args.lr, criterion))
+    optimizer = torch.optim.AdamW(build_param_groups(
+        model, args.lr, criterion, args.backbone_lr_mult, args.weight_decay))
     scheduler = build_warmup_cosine_scheduler(
         optimizer, args.warmup_steps, args.epochs * max(1, len(loader)))
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     ema = ModelEMA(model, args.ema_decay)
-    start_epoch, global_step, best_map = 0, 0, float("-inf")
+    start_epoch, resume_iteration, global_step, best_map = 0, 0, 0, float("-inf")
     if args.resume:
         _log(f"resuming checkpoint {args.resume}", rank)
-        start_epoch, global_step, best_map = _load_resume(
+        start_epoch, global_step, best_map, resume_iteration = _load_resume(
             args.resume, model, criterion, optimizer, scheduler, scaler, ema)
-        _log(f"resume ready: start_epoch={start_epoch + 1} global_step={global_step}", rank)
+        _log(f"resume ready: start_epoch={start_epoch + 1} "
+             f"resume_iteration={resume_iteration} global_step={global_step}", rank)
 
     if world_size > 1:
         ddp_kwargs = {"find_unused_parameters": True}
@@ -279,6 +326,9 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     _log(f"writing logs and checkpoints to {args.out}", rank)
+    if rank == 0 and args.step_checkpoint_every:
+        _log(f"overwriting {os.path.join(args.out, 'last_step.pth')} every "
+             f"{args.step_checkpoint_every} optimizer step(s)", rank)
     writer = _summary_writer(os.path.join(args.out, "tensorboard"), rank)
     val_loader = None
     if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
@@ -296,10 +346,32 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         _log(f"starting epoch {epoch + 1}/{args.epochs}", rank)
         sampler.set_epoch(epoch)
-        global_step = train_one_epoch(
+        def save_step_checkpoint(current_epoch, iteration, step):
+            if rank != 0 or not args.step_checkpoint_every:
+                return
+            if step % args.step_checkpoint_every:
+                return
+            next_iteration = iteration + 1
+            state = _checkpoint_state(
+                model, criterion, optimizer, scheduler, scaler, ema, cfg,
+                current_epoch, step, best_map, checkpoint_kind="step",
+                resume_epoch=current_epoch, resume_iteration=next_iteration)
+            last_path = os.path.join(args.out, "last_step.pth")
+            torch.save(state, last_path)
+            if args.keep_step_checkpoints:
+                torch.save(state, os.path.join(args.out, f"step_{step:08d}.pth"))
+
+        global_step, train_summary = train_one_epoch(
             model, criterion, loader, optimizer, scaler, device, cfg, epoch,
             scheduler=scheduler, ema=ema, writer=writer, global_step=global_step,
-            log_every=args.log_every, rank=rank, num_epochs=args.epochs)
+            clip=args.clip_grad_norm, log_every=args.log_every, rank=rank,
+            num_epochs=args.epochs,
+            start_iteration=resume_iteration if epoch == start_epoch else 0,
+            checkpoint_callback=save_step_checkpoint)
+        resume_iteration = 0
+        if writer is not None:
+            for key, value in train_summary.items():
+                writer.add_scalar(f"epoch_train/{key}", value, epoch + 1)
 
         metrics = None
         if rank == 0 and val_loader is not None and (epoch + 1) % args.eval_every == 0:
@@ -318,9 +390,12 @@ def main():
                 is_best = metrics["detection/map"] > best_map
                 best_map = max(best_map, metrics["detection/map"])
             state = _checkpoint_state(model, criterion, optimizer, scheduler, scaler,
-                                      ema, cfg, epoch, global_step, best_map)
+                                      ema, cfg, epoch, global_step, best_map,
+                                      checkpoint_kind="epoch",
+                                      resume_epoch=epoch + 1, resume_iteration=0)
             epoch_path = os.path.join(args.out, f"{cfg.name}_ep{epoch:03d}.pth")
             torch.save(state, epoch_path)
+            torch.save(state, os.path.join(args.out, "last_epoch.pth"))
             if is_best:
                 torch.save(state, os.path.join(args.out, "best_detection_map.pth"))
             _log(f"saved checkpoint {epoch_path}", rank)
