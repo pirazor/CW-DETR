@@ -16,8 +16,12 @@ from cwdetr.utils.box_ops import box_cxcywh_to_xyxy
 
 
 def _prediction_rows(det_out, image_hw, orig_hw, class_names, score_thresh, topk):
-    logits = det_out["pred_logits"].sigmoid()
+    logits = det_out["pred_logits"]
     boxes = det_out["pred_boxes"]
+    if logits.ndim == 3:
+        logits = logits[0]
+        boxes = boxes[0]
+    logits = logits.sigmoid()
     scores, labels = logits.max(-1)
     keep = scores >= score_thresh
     if keep.any():
@@ -110,12 +114,16 @@ def main():
         rows = _prediction_rows(
             outputs["detection"], image.shape[-2:], orig_hw, dataset.class_names,
             args.score_thresh, args.topk)
+        pred_count = len(rows)
+        gt_count = 0
         if args.draw_gt:
-            rows.extend(_ground_truth_rows(
-                batch["targets"]["detection"][0], orig_hw, dataset.class_names))
+            gt_rows = _ground_truth_rows(
+                batch["targets"]["detection"][0], orig_hw, dataset.class_names)
+            gt_count = len(gt_rows)
+            rows.extend(gt_rows)
         output_path = output_dir / f"{global_index:06d}_{image_path.stem}.jpg"
         _draw_rows(image_path, rows, output_path)
-        print(f"wrote {output_path}", flush=True)
+        print(f"wrote {output_path} preds={pred_count} gt={gt_count}", flush=True)
 
 
 if __name__ == "__main__":
