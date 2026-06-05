@@ -26,6 +26,7 @@ model:
     out_indices: [1, 2, 3]
     out_channels: [192, 384, 768]
     out_strides: [8, 16, 32]
+    train_backbone: true
     freeze_stages: 0
     drop_path_rate: 0.1
     gram_anchor_distill: false

@@ -268,6 +268,8 @@ def main():
                         help="backbone LR multiplier; 0.1 gives 2e-5 for lr=2e-4")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--clip-grad-norm", type=float, default=0.1)
+    parser.add_argument("--freeze-backbone", action="store_true",
+                        help="train projector/decoder/heads only; keep DINOv3 encoder frozen")
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--ema-decay", type=float, default=0.9998)
     parser.add_argument("--seed", type=int, default=1337)
@@ -307,9 +309,13 @@ def main():
     seed_everything(args.seed + rank)
     _log(f"loading config {args.config}", rank)
     cfg = load_config(args.config)
+    if args.freeze_backbone:
+        cfg.model.backbone.train_backbone = False
 
     _log("building model and loading backbone weights", rank)
     model = build_cwdetr(cfg).to(device)
+    if not cfg.model.backbone.train_backbone:
+        _log("DINOv3 encoder is frozen; training projector/decoder/heads only", rank)
     trainable = sum(parameter.numel() for parameter in model.parameters()
                     if parameter.requires_grad)
     _log(f"model ready: {trainable / 1e6:.2f}M trainable parameters", rank)

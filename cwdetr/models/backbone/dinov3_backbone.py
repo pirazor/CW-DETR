@@ -82,6 +82,7 @@ class DINOv3Backbone(nn.Module):
         self.patch_size = 16
         self.num_register_tokens = cfg.num_register_tokens
         self._encoder_channels: Optional[List[int]] = None
+        self.encoder_frozen = False
 
         if self.kind == "dinov3_vit" and cfg.windowed_attention:
             raise ValueError(
@@ -104,6 +105,8 @@ class DINOv3Backbone(nn.Module):
             self.out_channels = list(self._encoder_channels or cfg.out_channels)
 
         self._maybe_freeze(cfg)
+        if not cfg.train_backbone:
+            self.freeze_encoder()
 
         # Optional frozen teacher for Gram-anchored feature distillation.
         self.teacher: Optional[nn.Module] = None
@@ -205,9 +208,21 @@ class DINOv3Backbone(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.encoder_frozen:
+            self.encoder.eval()
         if self.teacher is not None:
             self.teacher.eval()
         return self
+
+    def freeze_encoder(self) -> int:
+        frozen = 0
+        for parameter in self.encoder.parameters():
+            if parameter.requires_grad:
+                frozen += parameter.numel()
+            parameter.requires_grad_(False)
+        self.encoder.eval()
+        self.encoder_frozen = True
+        return frozen
 
     def _maybe_freeze(self, cfg: BackboneCfg):
         n = cfg.freeze_stages if self.kind == "dinov3_convnext" else cfg.freeze_blocks

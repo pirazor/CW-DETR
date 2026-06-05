@@ -55,6 +55,7 @@ class BackboneCfg:
     out_indices: List[int] = field(default_factory=lambda: [1, 2, 3])
     out_channels: List[int] = field(default_factory=lambda: [192, 384, 768])
     out_strides: List[int] = field(default_factory=lambda: [8, 16, 32])
+    train_backbone: bool = True
     freeze_stages: int = 0
     # ViT path
     embed_dim: int = 768
