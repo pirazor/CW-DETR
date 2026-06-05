@@ -215,7 +215,7 @@ def evaluate_loader(model, loader, device, num_classes: int,
 
 
 def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None,
-                       refresh_yolo_index=False):
+                       refresh_yolo_index=False, yolo_image_cache="none"):
     transforms = build_transforms(cfg, train=False)
     datasets = []
     if bdd_root:
@@ -226,7 +226,7 @@ def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None,
         datasets.append(YoloDetectionDataset(
             yolo_data, "val", transforms,
             expected_num_classes=cfg.model.heads.detection.num_classes,
-            refresh_index=refresh_yolo_index))
+            refresh_index=refresh_yolo_index, image_cache=yolo_image_cache))
     if not datasets:
         raise ValueError("provide at least one validation root")
     return ConcatMultiTaskDataset(datasets)
@@ -248,6 +248,9 @@ def main():
                         help="YOLO data.yaml for detection-only evaluation")
     parser.add_argument("--refresh-yolo-index", action="store_true",
                         help="rescan YOLO images and rebuild parsed-label caches")
+    parser.add_argument("--yolo-image-cache", default="none",
+                        choices=("none", "ram-float32"),
+                        help="experimental YOLO image cache mode")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
@@ -266,7 +269,7 @@ def main():
         model.load_state_dict(checkpoint.get("ema", checkpoint.get("model", checkpoint)),
                               strict=False)
     dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data,
-                                 args.refresh_yolo_index)
+                                 args.refresh_yolo_index, args.yolo_image_cache)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         collate_fn=collate_fn,
                         **dataloader_worker_kwargs(args, device, seed=1337))

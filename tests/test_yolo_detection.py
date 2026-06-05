@@ -139,6 +139,32 @@ def test_yolo_detection_dataset_uses_parsed_labels_during_getitem(tmp_path):
         assert dataset[0]["labels"].tolist() == [0]
 
 
+def test_yolo_detection_dataset_can_cache_images_as_float32_ram(tmp_path):
+    yaml_path = _write_yaml(tmp_path)
+    image_path = _write_image(tmp_path, "train", "sample.jpg")
+    label = tmp_path / "train" / "labels" / "sample.txt"
+    label.parent.mkdir(parents=True)
+    label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+
+    dataset = YoloDetectionDataset(
+        str(yaml_path), "train", expected_num_classes=9,
+        image_cache="ram-float32")
+    assert dataset.image_cache is not None
+    assert dataset.image_cache[0].dtype == np.float32
+
+    original_open = Image.open
+
+    def reject_image_open(path, *args, **kwargs):
+        if Path(path) == image_path:
+            raise AssertionError("getitem must not reopen cached YOLO image files")
+        return original_open(path, *args, **kwargs)
+
+    with mock.patch.object(Image, "open", reject_image_open):
+        sample = dataset[0]
+    assert sample["orig_size"] == (10, 20)
+    assert sample["labels"].tolist() == [0]
+
+
 def test_yolo_detection_dataset_imports_existing_ultralytics_label_cache(tmp_path):
     yaml_path = _write_yaml(tmp_path)
     image = _write_image(tmp_path, "train", "sample.jpg")

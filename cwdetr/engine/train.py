@@ -57,7 +57,8 @@ def build_datasets(cfg, args):
         datasets.append(YoloDetectionDataset(
             args.yolo_data, "train", transforms,
             expected_num_classes=cfg.model.heads.detection.num_classes,
-            refresh_index=getattr(args, "refresh_yolo_index", False)))
+            refresh_index=getattr(args, "refresh_yolo_index", False),
+            image_cache=getattr(args, "yolo_image_cache", "none")))
         weights.append(2.0)
     if args.gtsrb_root:
         datasets.append(GTSRBSigns(args.gtsrb_root, "train", transforms))
@@ -256,6 +257,9 @@ def main():
                         help="YOLO data.yaml for detection-only training")
     parser.add_argument("--refresh-yolo-index", action="store_true",
                         help="rescan YOLO images and rebuild parsed-label caches")
+    parser.add_argument("--yolo-image-cache", default="none",
+                        choices=("none", "ram-float32"),
+                        help="experimental YOLO image cache mode")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--nuscenes-root", default=None)
     parser.add_argument("--nuscenes-version", default="v1.0-trainval")
@@ -371,7 +375,8 @@ def main():
     if rank == 0 and (args.bdd_root or args.gtsrb_root or args.yolo_data):
         _log("building validation datasets", rank)
         val_dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root,
-                                         args.yolo_data, args.refresh_yolo_index)
+                                         args.yolo_data, args.refresh_yolo_index,
+                                         args.yolo_image_cache)
         val_loader = DataLoader(
             val_dataset, batch_size=args.eval_batch_size, shuffle=False,
             collate_fn=collate_fn,

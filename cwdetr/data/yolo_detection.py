@@ -86,11 +86,13 @@ class YoloDetectionDataset(Dataset):
     """Read YOLO detection labels into CW-DETR's normalized target contract."""
 
     def __init__(self, data_yaml: str, split: str, transforms=None,
-                 expected_num_classes: Optional[int] = None,
-                 refresh_index: bool = False):
+                  expected_num_classes: Optional[int] = None,
+                  refresh_index: bool = False, image_cache: str = "none"):
         self.data_yaml = Path(data_yaml).expanduser().resolve()
         self.split = split
         self.transforms = transforms
+        self.image_cache_mode = image_cache
+        self.image_cache: Optional[List[np.ndarray]] = None
         spec = yaml.safe_load(_retry_remote_io(
             lambda: self.data_yaml.read_text(encoding="utf-8"),
             f"reading YOLO dataset config {self.data_yaml}")) or {}
@@ -133,6 +135,12 @@ class YoloDetectionDataset(Dataset):
             self.data_yaml.parent / f".cwdetr-{self.data_yaml.stem}-{split}-labels.json")
         self.ultralytics_cache_path = self.label_dir.with_suffix(".cache")
         self.labels = self._load_label_cache(refresh_index)
+        if self.image_cache_mode == "ram-float32":
+            self.image_cache = self._cache_images_float32()
+        elif self.image_cache_mode not in {"none", None}:
+            raise ValueError(
+                "unsupported YOLO image cache mode "
+                f"{self.image_cache_mode!r}; expected 'none' or 'ram-float32'")
 
     def _load_images(self, refresh_index: bool) -> List[Path]:
         index_exists = _retry_remote_io(
@@ -326,14 +334,64 @@ class YoloDetectionDataset(Dataset):
         _log(self.split, f"cached parsed labels in {self.label_cache_path}")
         return labels
 
-    def __getitem__(self, index: int) -> Dict:
-        image_path = self.images[index]
+    def _load_pil_image(self, image_path: Path) -> Image.Image:
         def load_image():
             with Image.open(image_path) as opened:
                 opened.load()
                 return opened.convert("RGB")
 
-        image = _retry_remote_io(load_image, f"reading YOLO image file {image_path}")
+        return _retry_remote_io(load_image, f"reading YOLO image file {image_path}")
+
+    @staticmethod
+    def _available_ram_bytes() -> Optional[int]:
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available)
+        except ImportError:
+            return None
+
+    def _estimate_float32_cache_bytes(self, sample_count: int = 32) -> int:
+        sample_count = min(sample_count, len(self.images))
+        total = 0
+        for image_path in self.images[:sample_count]:
+            with self._load_pil_image(image_path) as image:
+                width, height = image.size
+            total += height * width * 3 * np.dtype(np.float32).itemsize
+        return int(total / max(1, sample_count) * len(self.images))
+
+    def _cache_images_float32(self) -> List[np.ndarray]:
+        estimated = self._estimate_float32_cache_bytes()
+        available = self._available_ram_bytes()
+        gib = 1024 ** 3
+        if available is not None and estimated > int(available * 0.85):
+            raise MemoryError(
+                f"YOLO {self.split} ram-float32 image cache needs about "
+                f"{estimated / gib:.1f} GiB, but only {available / gib:.1f} GiB "
+                "is currently available. Use a smaller input/cache mode or disable "
+                "ram-float32 caching.")
+        workers = min(8, os.cpu_count() or 1, len(self.images))
+        _log(self.split, f"caching {len(self.images)} decoded RGB images as float32 "
+             f"RAM arrays (~{estimated / gib:.1f} GiB) with {workers} threads")
+
+        def load_array(image_path: Path) -> np.ndarray:
+            image = self._load_pil_image(image_path)
+            return np.asarray(image, dtype=np.float32) / 255.0
+
+        with ThreadPool(workers) as pool:
+            arrays = list(progress(
+                pool.imap(load_array, self.images),
+                total=len(self.images), desc=f"cache images ({self.split})",
+                dynamic_ncols=True))
+        _log(self.split, "finished ram-float32 image cache")
+        return arrays
+
+    def __getitem__(self, index: int) -> Dict:
+        image_path = self.images[index]
+        if self.image_cache is None:
+            image = self._load_pil_image(image_path)
+        else:
+            cached = self.image_cache[index]
+            image = Image.fromarray(np.clip(cached * 255.0, 0, 255).astype(np.uint8), "RGB")
         width, height = image.size
         labels, boxes = self.labels[index]
         relative_path = image_path.relative_to(self.image_dir).as_posix()
