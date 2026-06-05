@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -13,7 +15,8 @@ from cwdetr.data.transforms import RandomScaleCrop
 from cwdetr.engine.evaluate import (METRIC_KEYS, BinaryLaneMetrics, SemanticMetrics,
                                     SignTop1, evaluate_loader)
 from cwdetr.engine.train import _checkpoint_state, train_one_epoch
-from cwdetr.engine.utils import ModelEMA, build_warmup_cosine_scheduler
+from cwdetr.engine.utils import (ModelEMA, build_warmup_cosine_scheduler,
+                                 dataloader_worker_kwargs)
 
 
 class _SizedDataset(Dataset):
@@ -137,6 +140,23 @@ def test_mixed_batch_sampler_is_seeded_and_rank_sharded():
     rank1 = list(MixedBatchSampler(concat, 2, seed=7, rank=1, world_size=2))
     assert not {tuple(batch) for batch in rank0} & {tuple(batch) for batch in rank1}
     assert len(rank0) + len(rank1) == 8
+
+
+def test_dataloader_kwargs_prefetch_only_with_workers():
+    args = SimpleNamespace(
+        workers=4, prefetch_factor=6, no_persistent_workers=False, seed=11)
+    kwargs = dataloader_worker_kwargs(args, torch.device("cuda"), seed=args.seed, rank=2)
+    assert kwargs["num_workers"] == 4
+    assert kwargs["pin_memory"]
+    assert kwargs["prefetch_factor"] == 6
+    assert kwargs["persistent_workers"]
+
+    args.workers = 0
+    kwargs = dataloader_worker_kwargs(args, torch.device("cpu"), seed=args.seed, rank=0)
+    assert kwargs["num_workers"] == 0
+    assert not kwargs["pin_memory"]
+    assert "prefetch_factor" not in kwargs
+    assert "persistent_workers" not in kwargs
 
 
 def test_warmup_cosine_scheduler_and_ema_checkpoint_state():

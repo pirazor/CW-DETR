@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Optional
 
 import torch
@@ -163,12 +164,17 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
     if start_iteration:
         _log(f"resuming epoch {epoch + 1}: skipping {start_iteration} completed batches", rank)
     accum, count = {}, 0
+    log_start = time.perf_counter()
+    log_images = 0
+    if rank == 0 and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     for iteration, batch in enumerate(iterator):
         if iteration < start_iteration:
             continue
         images = batch["images"].to(device, non_blocking=True)
         targets = targets_to_device(batch["targets"], device)
         sign_rois = batch["extras"]["sign_rois"].to(device)
+        log_images += int(images.shape[0])
 
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             outputs = model(images, sign_rois=sign_rois if sign_rois.numel() else None,
@@ -208,6 +214,19 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
         if checkpoint_callback is not None:
             checkpoint_callback(epoch, iteration, global_step)
         if rank == 0 and iteration % log_every == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = max(time.perf_counter() - log_start, 1e-9)
+            imgs_per_sec = log_images / elapsed
+            gpu_memory = ""
+            if device.type == "cuda":
+                gib = 1024 ** 3
+                allocated = torch.cuda.max_memory_allocated(device) / gib
+                reserved = torch.cuda.max_memory_reserved(device) / gib
+                gpu_memory = f" gpu_alloc={allocated:.2f}GiB gpu_reserved={reserved:.2f}GiB"
+                torch.cuda.reset_peak_memory_stats(device)
+            log_start = time.perf_counter()
+            log_images = 0
             active = " ".join(
                 f"{key}={value:.3f}" for key, value in scalars.items()
                 if key in ("detection", "det/precision", "det/mean_score",
@@ -215,6 +234,7 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, cfg, ep
             message = (f"epoch={epoch + 1} batch={iteration + 1}/{len(loader)} "
                        f"step={global_step} total={scalars['total']:.3f} "
                        f"lr={optimizer.param_groups[0]['lr']:.2e} "
+                       f"imgs/s={imgs_per_sec:.1f}{gpu_memory} "
                        f"dataset={batch['extras']['dataset']} {active}")
             progress_write(f"[train] {message}")
     summary = {key: value / max(1, count) for key, value in accum.items()}
