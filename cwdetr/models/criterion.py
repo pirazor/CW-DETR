@@ -105,13 +105,21 @@ class MultiTaskCriterion(nn.Module):
         if not targets:
             zero = det_out["pred_logits"].sum() * 0.0 + det_out["pred_boxes"].sum() * 0.0
             return {"detection": zero, "det/loss_ce": zero,
-                    "det/loss_bbox": zero, "det/loss_giou": zero}
+                    "det/loss_bbox": zero, "det/loss_giou": zero,
+                    "det/precision": zero, "det/mean_score": zero,
+                    "det/num_targets": zero}
 
         all_outputs = [{"pred_logits": det_out["pred_logits"],
                         "pred_boxes": det_out["pred_boxes"]}] + det_out.get("aux_outputs", [])
-        num_boxes = max(1, sum(len(t["labels"]) for t in targets))
+        target_count = sum(len(t["labels"]) for t in targets)
+        num_boxes = max(1, target_count)
         total = {"loss_ce": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
-        for out in all_outputs:
+        stats = {
+            "precision": det_out["pred_logits"].new_zeros(()),
+            "mean_score": det_out["pred_logits"].new_zeros(()),
+            "num_targets": det_out["pred_logits"].new_tensor(float(target_count)),
+        }
+        for output_index, out in enumerate(all_outputs):
             indices = self.matcher(out, targets)
             bidx, sidx = self._src_perm(indices)
 
@@ -123,6 +131,13 @@ class MultiTaskCriterion(nn.Module):
                 if len(bidx) else torch.zeros(0, dtype=torch.long, device=logits.device)
             if len(bidx):
                 target_classes[bidx, sidx] = tgt_lbl
+            if output_index == 0:
+                with torch.no_grad():
+                    if len(bidx):
+                        matched_prob = logits.sigmoid()[bidx, sidx]
+                        scores, pred_labels = matched_prob.max(-1)
+                        stats["precision"] = (pred_labels == tgt_lbl).float().mean()
+                        stats["mean_score"] = scores.mean()
             onehot = F.one_hot(target_classes, self.num_classes + 1)[..., :-1].float()
             total["loss_ce"] += sigmoid_focal_loss(
                 logits, onehot, self.focal_alpha) / num_boxes
@@ -135,7 +150,11 @@ class MultiTaskCriterion(nn.Module):
                 total["loss_giou"] += (1 - torch.diag(generalized_box_iou(
                     box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(tgt_boxes)))).sum() / num_boxes
         det_loss = sum(self.det_weights[k] * v for k, v in total.items())
-        return {"detection": det_loss, **{f"det/{k}": v for k, v in total.items()}}
+        return {"detection": det_loss,
+                **{f"det/{key}": value for key, value in total.items()},
+                "det/precision": stats["precision"],
+                "det/mean_score": stats["mean_score"],
+                "det/num_targets": stats["num_targets"]}
 
     def loss_dn_detection(self, dn_out, meta) -> Dict[str, torch.Tensor]:
         all_outputs = [{"pred_logits": dn_out["pred_logits"],

@@ -12,9 +12,10 @@ from torch.utils.data import DataLoader
 
 from cwdetr.config import load_config
 from cwdetr.data import (BDD100KDataset, ConcatMultiTaskDataset, GTSRBSigns,
-                         build_transforms, collate_fn)
-from cwdetr.engine.utils import targets_to_device
+                         build_transforms, collate_fn, YoloDetectionDataset)
+from cwdetr.engine.utils import dataloader_worker_kwargs, targets_to_device
 from cwdetr.models.cwdetr import build_cwdetr
+from cwdetr.utils.progress import progress as iter_progress
 
 
 METRIC_KEYS = (
@@ -178,14 +179,17 @@ def empty_metrics() -> Dict[str, float]:
 
 @torch.no_grad()
 def evaluate_loader(model, loader, device, num_classes: int,
-                    max_batches: Optional[int] = None) -> Dict[str, float]:
+                    max_batches: Optional[int] = None,
+                    progress: bool = False) -> Dict[str, float]:
     model.eval()
     detection = CocoDetectionMetrics(num_classes)
     drivable = SemanticMetrics(3)
     lane = BinaryLaneMetrics()
     signs = SignTop1()
 
-    for batch_index, batch in enumerate(loader):
+    progress_bar = iter_progress(
+        loader, desc="validate", dynamic_ncols=True, disable=not progress)
+    for batch_index, batch in enumerate(progress_bar):
         if max_batches is not None and batch_index >= max_batches:
             break
         images = batch["images"].to(device, non_blocking=True)
@@ -210,13 +214,19 @@ def evaluate_loader(model, loader, device, num_classes: int,
     return metrics
 
 
-def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None):
+def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None, yolo_data=None,
+                       refresh_yolo_index=False, yolo_image_cache="none"):
     transforms = build_transforms(cfg, train=False)
     datasets = []
     if bdd_root:
         datasets.append(BDD100KDataset(bdd_root, "val", transforms, load_seg=True))
     if gtsrb_root:
         datasets.append(GTSRBSigns(gtsrb_root, "test", transforms))
+    if yolo_data:
+        datasets.append(YoloDetectionDataset(
+            yolo_data, "val", transforms,
+            expected_num_classes=cfg.model.heads.detection.num_classes,
+            refresh_index=refresh_yolo_index, image_cache=yolo_image_cache))
     if not datasets:
         raise ValueError("provide at least one validation root")
     return ConcatMultiTaskDataset(datasets)
@@ -224,9 +234,9 @@ def build_eval_dataset(cfg, bdd_root=None, gtsrb_root=None):
 
 def print_metrics(metrics: Dict[str, float]) -> None:
     width = max(len(key) for key in METRIC_KEYS)
-    print("CW-DETR validation metrics")
+    print("CW-DETR validation metrics", flush=True)
     for key in METRIC_KEYS:
-        print(f"  {key:<{width}}  {metrics[key]:.4f}")
+        print(f"  {key:<{width}}  {metrics[key]:.4f}", flush=True)
 
 
 def main():
@@ -234,11 +244,22 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--ckpt", default=None)
     parser.add_argument("--bdd-root", default=None)
+    parser.add_argument("--yolo-data", default=None,
+                        help="YOLO data.yaml for detection-only evaluation")
+    parser.add_argument("--refresh-yolo-index", action="store_true",
+                        help="rescan YOLO images and rebuild parsed-label caches")
+    parser.add_argument("--yolo-image-cache", default="none",
+                        choices=("none", "ram-float32"),
+                        help="experimental YOLO image cache mode")
     parser.add_argument("--gtsrb-root", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--max-batches", type=int, default=None)
     args = parser.parse_args()
+    if args.workers < 0 or args.prefetch_factor <= 0:
+        parser.error("--workers must be non-negative and --prefetch-factor must be positive")
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -247,13 +268,14 @@ def main():
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         model.load_state_dict(checkpoint.get("ema", checkpoint.get("model", checkpoint)),
                               strict=False)
-    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root)
+    dataset = build_eval_dataset(cfg, args.bdd_root, args.gtsrb_root, args.yolo_data,
+                                 args.refresh_yolo_index, args.yolo_image_cache)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.workers, collate_fn=collate_fn,
-                        pin_memory=device.type == "cuda")
+                        collate_fn=collate_fn,
+                        **dataloader_worker_kwargs(args, device, seed=1337))
     metrics = evaluate_loader(model, loader, device,
                               cfg.model.heads.detection.num_classes,
-                              args.max_batches)
+                              args.max_batches, progress=True)
     print_metrics(metrics)
 
 

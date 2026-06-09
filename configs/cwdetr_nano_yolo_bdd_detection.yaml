@@ -1,0 +1,88 @@
+# CW-DETR-Nano object-detection-only baseline for the merged BDD100K YOLO export.
+# Class IDs must match the dataset data.yaml exactly.
+name: cwdetr-nano-yolo-bdd-detection
+description: Detection-only CW-DETR baseline for merged BDD100K YOLO labels.
+
+input:
+  height: 384
+  width: 640
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std:  [0.229, 0.224, 0.225]
+
+augmentation:
+  enabled: true
+  scale_min: 0.8
+  scale_max: 1.2
+  crop_prob: 0.5
+  hflip_prob: 0.5
+  photometric_prob: 0.8
+
+model:
+  hidden_dim: 256
+  backbone:
+    type: dinov3_convnext
+    source: huggingface
+    hf_name: facebook/dinov3-convnext-tiny-pretrain-lvd1689m
+    out_indices: [1, 2, 3]
+    out_channels: [192, 384, 768]
+    out_strides: [8, 16, 32]
+    train_backbone: true
+    freeze_stages: 0
+    drop_path_rate: 0.1
+    gram_anchor_distill: false
+
+  projector:
+    type: c2f_multiscale
+    num_levels: 3
+    hidden_dim: 256
+
+  decoder:
+    hidden_dim: 256
+    num_heads: 8
+    num_layers: 3
+    dim_feedforward: 1024
+    num_queries: 300
+    num_feature_levels: 3
+    dec_n_points: 4
+    two_stage: true
+    look_forward_twice: true
+    dn_enabled: false
+    dn_num_groups: 5
+    label_noise_ratio: 0.2
+    box_noise_scale: 1.0
+    dn_loss_weight: 1.0
+
+  heads:
+    detection:
+      enabled: true
+      num_classes: 9
+    tracking:
+      enabled: false
+      mode: bytetrack_only
+      max_active_tracks: 200
+      score_thresh: 0.5
+      match_thresh: 0.8
+    segmentation:
+      enabled: false
+      drivable_classes: 3
+      lane_classes: 3
+      mask_stride: 4
+    sign_classification:
+      enabled: false
+      num_sign_classes: 43
+      source_det_class: 8
+      roi_size: 7
+    trajectory:
+      enabled: false
+      history_len: 10
+      future_len: 12
+      step_dt: 0.5
+      num_modes: 6
+      space: image
+
+deploy:
+  target: jetson_orin_nano
+  precision: int8
+  fp16_fallback: true
+  max_workspace_gb: 4
+  calib_images: 500

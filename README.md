@@ -126,6 +126,42 @@ python -m cwdetr.export.profile_jetson --core-engine cwdetr_nano_int8.plan \
     --sign-engine cwdetr_sign_fp16.plan --precision int8 --out profiles/nano_int8.json
 ```
 
+### YOLO-format BDD100K detection-only training
+
+For a YOLO export with sibling `images/` and `labels/` directories, use the
+nine-class detection-only config and pass its `data.yaml` directly:
+
+```bash
+python -m cwdetr.engine.train \
+    --config configs/cwdetr_nano_yolo_bdd_detection.yaml \
+    --yolo-data /data/bdd100k_merged/data.yaml --epochs 50
+python -m cwdetr.engine.evaluate \
+    --config configs/cwdetr_nano_yolo_bdd_detection.yaml \
+    --yolo-data /data/bdd100k_merged/data.yaml \
+    --ckpt checkpoints/best_detection_map.pth
+```
+
+The first run caches per-split image manifests and parsed labels beside
+`data.yaml`, avoiding repeated recursive scans and per-sample label-file reads
+on mounted Google Drive. Existing Ultralytics `labels.cache` files are imported
+when available. Pass `--refresh-yolo-index` after adding, removing, or editing
+images or labels. The adapter retries transient mounted-drive read failures.
+Training writes `last_step.pth` in the run directory by default after every
+optimizer step, plus `last_epoch.pth`, numbered epoch checkpoints, and
+`best_detection_map.pth` after validation. Use `--step-checkpoint-every 0` to
+disable per-step checkpointing, or `--keep-step-checkpoints` only if you want
+numbered step files.
+
+For Google Drive-backed Colab runs, `--workers 0` is easiest to debug but often
+starves a large GPU. Try `--workers 4 --prefetch-factor 4` or `--workers 8` when
+Drive is stable; each worker prepares prefetched batches while the GPU trains.
+If I/O errors return, lower workers first. Exact per-step full checkpoints to
+Drive are also expensive, so use `--step-checkpoint-every 50` or `100` for
+throughput and set it back to `1` only when exact step recovery is required.
+
+Colab workflow:
+**[`notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb`](notebooks/CW_DETR_YOLO_Detection_Training_Colab.ipynb)**.
+
 ## Repository layout
 
 ```

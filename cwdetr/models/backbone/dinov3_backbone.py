@@ -82,6 +82,7 @@ class DINOv3Backbone(nn.Module):
         self.patch_size = 16
         self.num_register_tokens = cfg.num_register_tokens
         self._encoder_channels: Optional[List[int]] = None
+        self.encoder_frozen = False
 
         if self.kind == "dinov3_vit" and cfg.windowed_attention:
             raise ValueError(
@@ -104,6 +105,8 @@ class DINOv3Backbone(nn.Module):
             self.out_channels = list(self._encoder_channels or cfg.out_channels)
 
         self._maybe_freeze(cfg)
+        if not cfg.train_backbone:
+            self.freeze_encoder()
 
         # Optional frozen teacher for Gram-anchored feature distillation.
         self.teacher: Optional[nn.Module] = None
@@ -205,9 +208,21 @@ class DINOv3Backbone(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.encoder_frozen:
+            self.encoder.eval()
         if self.teacher is not None:
             self.teacher.eval()
         return self
+
+    def freeze_encoder(self) -> int:
+        frozen = 0
+        for parameter in self.encoder.parameters():
+            if parameter.requires_grad:
+                frozen += parameter.numel()
+            parameter.requires_grad_(False)
+        self.encoder.eval()
+        self.encoder_frozen = True
+        return frozen
 
     def _maybe_freeze(self, cfg: BackboneCfg):
         n = cfg.freeze_stages if self.kind == "dinov3_convnext" else cfg.freeze_blocks
@@ -250,6 +265,35 @@ class DINOv3Backbone(nn.Module):
                     f"{expected_hw[0]}, {expected_hw[1]}] at stride {stride}")
         return feats
 
+    @staticmethod
+    def _select_convnext_features(x: torch.Tensor, hidden_states,
+                                  out_channels: List[int],
+                                  out_strides: List[int]) -> List[torch.Tensor]:
+        """Resolve HF AutoModel stage maps by contract instead of tuple position.
+
+        Transformers versions differ in whether ConvNeXt hidden states include
+        an embedding/stem output. Matching channels and spatial stride avoids an
+        off-by-one stage selection when AutoBackbone is unavailable.
+        """
+        candidates = [state for state in hidden_states
+                      if torch.is_tensor(state) and state.ndim == 4]
+        height, width = x.shape[-2:]
+        selected = []
+        for channels, stride in zip(out_channels, out_strides):
+            expected_hw = (height // stride, width // stride)
+            matches = [state for state in candidates
+                       if state.shape[1] == channels and state.shape[-2:] == expected_hw]
+            if not matches:
+                observed = [tuple(state.shape) for state in candidates]
+                raise ValueError(
+                    "DINOv3 ConvNeXt AutoModel fallback cannot resolve feature "
+                    f"[B, {channels}, {expected_hw[0]}, {expected_hw[1]}] at stride "
+                    f"{stride}; observed hidden states: {observed}")
+            # Prefer the final match if a version exposes both pre-stage and
+            # post-stage tensors at the same resolution.
+            selected.append(matches[-1])
+        return selected
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """x: normalized image tensor [B, 3, H, W] -> list of feature maps."""
         h, w = x.shape[-2:]
@@ -264,7 +308,8 @@ class DINOv3Backbone(nn.Module):
                 feats = list(self.encoder(x).feature_maps)
             else:
                 out = self.encoder(x, output_hidden_states=True)
-                feats = [out.hidden_states[i] for i in self.cfg.out_indices]
+                feats = self._select_convnext_features(
+                    x, out.hidden_states, self.out_channels, self.out_strides)
             return self._validate_features(x, feats)
 
         # ----- ViT path: single stride-16 map -> simple feature pyramid ---- #

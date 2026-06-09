@@ -57,11 +57,16 @@ class DummyMetaHubEncoder(nn.Module):
 
     channels = [96, 192, 384, 768]
 
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+
     def get_intermediate_layers(self, x, n=1, reshape=False):
         stages = list(range(4 - n, 4)) if isinstance(n, int) else list(n)
         b, _, h, w = x.shape
-        return tuple(torch.randn(b, self.channels[stage],
-                                 h // (2 ** (stage + 2)), w // (2 ** (stage + 2)))
+        return tuple(self.scale * torch.randn(b, self.channels[stage],
+                                              h // (2 ** (stage + 2)),
+                                              w // (2 ** (stage + 2)))
                      for stage in stages)
 
 
@@ -142,6 +147,23 @@ def test_meta_hub_random_init_without_weights():
     print("  [ok] official Meta repository random init")
 
 
+def test_backbone_train_backbone_false_freezes_encoder():
+    cfg = BackboneCfg(
+        source="meta_hub", meta_model="dinov3_convnext_tiny",
+        weights="checkpoint.pth", out_indices=[1, 2, 3],
+        out_channels=[192, 384, 768], out_strides=[8, 16, 32],
+        train_backbone=False)
+    module = SimpleNamespace(dinov3_convnext_tiny=lambda **_: DummyMetaHubEncoder())
+    with mock.patch.object(DINOv3Backbone, "_resolve_meta_repo", return_value="repo"), \
+            mock.patch("importlib.import_module", return_value=module):
+        backbone = DINOv3Backbone(cfg)
+    assert not any(parameter.requires_grad for parameter in backbone.encoder.parameters())
+    backbone.encoder.train()
+    backbone.train()
+    assert not backbone.encoder.training
+    print("  [ok] frozen DINOv3 encoder stays eval-only")
+
+
 def test_meta_hub_vit_uses_final_map_and_validates_fpn_contract():
     cfg = BackboneCfg(
         type="dinov3_vit", source="meta_hub", meta_model="dinov3_vitb16",
@@ -174,6 +196,22 @@ def test_backbone_stride_contract_rejects_wrong_config():
         else:
             raise AssertionError("wrong backbone stride config must fail")
     print("  [ok] backbone stride contract")
+
+
+def test_hf_convnext_automodel_fallback_selects_stride_contract():
+    image = torch.randn(2, 3, 384, 640)
+    hidden_states = (
+        torch.randn(2, 96, 96, 160),
+        torch.randn(2, 96, 96, 160),
+        torch.randn(2, 192, 48, 80),
+        torch.randn(2, 384, 24, 40),
+        torch.randn(2, 768, 12, 20),
+    )
+    feats = DINOv3Backbone._select_convnext_features(
+        image, hidden_states, [192, 384, 768], [8, 16, 32])
+    assert [tuple(feat.shape) for feat in feats] == [
+        (2, 192, 48, 80), (2, 384, 24, 40), (2, 768, 12, 20)]
+    print("  [ok] HF ConvNeXt AutoModel fallback stage selection")
 
 
 def test_vit_windowing_fails_closed():
@@ -417,8 +455,10 @@ def test_full_model_with_dummy_backbone():
 
 ARGS = None
 TESTS = [test_deform_attn, test_config_load_nested_dataclasses, test_meta_hub_backbone_loader,
-         test_meta_hub_random_init_without_weights, test_meta_hub_vit_uses_final_map_and_validates_fpn_contract,
-         test_backbone_stride_contract_rejects_wrong_config, test_vit_windowing_fails_closed,
+         test_meta_hub_random_init_without_weights, test_backbone_train_backbone_false_freezes_encoder,
+         test_meta_hub_vit_uses_final_map_and_validates_fpn_contract,
+         test_backbone_stride_contract_rejects_wrong_config,
+         test_hf_convnext_automodel_fallback_selects_stride_contract, test_vit_windowing_fails_closed,
          test_frozen_teacher_stays_in_eval_mode, test_encoder_proposal_centers,
          test_transformer_and_detection_head, test_encoder_proposal_head_receives_gradients,
          test_matcher_and_criterion, test_criterion_skips_absent_segmentation_targets,
